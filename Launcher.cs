@@ -16,7 +16,8 @@ internal static class Launcher
         "App.ps1", "App.xaml", "Apply-Changes.ps1", "Check-Coder.ps1",
         "Coder.psm1", "CoderJob.psm1", "CredentialStore.psm1", "HostManagement.psm1",
         "HostManager.ps1", "HostManager.xaml", "Mappings.psm1", "Operations.psm1",
-        "SshConfig.psm1", "Start-Coder.ps1"
+        "SshConfig.psm1", "Start-Coder.ps1", "CoderTerminal.psm1",
+        "PreparationJob.psm1", "Start-Prepare.ps1"
     };
 
     [STAThread]

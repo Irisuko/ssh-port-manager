@@ -6,7 +6,7 @@ $ProgressPreference = 'SilentlyContinue'
 if ($PSVersionTable.PSEdition -eq 'Core') { throw 'Run packaging checks with Windows PowerShell 5.1.' }
 $project = Split-Path -Parent $PSScriptRoot
 $fixture = Join-Path $PSScriptRoot ('.package-check-' + [Guid]::NewGuid().ToString('N'))
-$payload = @('App.ps1', 'App.xaml', 'Apply-Changes.ps1', 'Check-Coder.ps1', 'Coder.psm1', 'CoderJob.psm1', 'CredentialStore.psm1', 'HostManagement.psm1', 'HostManager.ps1', 'HostManager.xaml', 'Mappings.psm1', 'Operations.psm1', 'SshConfig.psm1', 'Start-Coder.ps1')
+$payload = @('App.ps1', 'App.xaml', 'Apply-Changes.ps1', 'Check-Coder.ps1', 'Coder.psm1', 'CoderJob.psm1', 'CredentialStore.psm1', 'HostManagement.psm1', 'HostManager.ps1', 'HostManager.xaml', 'Mappings.psm1', 'Operations.psm1', 'SshConfig.psm1', 'Start-Coder.ps1', 'CoderTerminal.psm1', 'PreparationJob.psm1', 'Start-Prepare.ps1')
 $checks = 0
 
 function Assert-Package([bool]$Condition, [string]$Message) {

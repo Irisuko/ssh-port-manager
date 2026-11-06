@@ -41,7 +41,7 @@
       <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
       <StackPanel>
         <TextBlock Text="SSH 端口助手" FontWeight="SemiBold" FontSize="28"/>
-        <TextBlock Text="启动远端工作区并同步端口，或手动更新 SSH 连接。" Foreground="#61748D" Margin="0,7,0,0"/>
+        <TextBlock Text="启动或选择服务器，执行权限命令并同步 SSH 连接。" Foreground="#61748D" Margin="0,7,0,0"/>
       </StackPanel>
       <Border Grid.Column="1" Background="#E5EEFF" CornerRadius="8" Padding="13,9" VerticalAlignment="Center">
         <TextBlock Text="36.140.239.91" Foreground="#235EC4" FontFamily="Consolas" FontSize="15"/>
@@ -74,7 +74,7 @@
               </Grid>
               <Button x:Name="StartSyncButton" Grid.Column="1" Content="启动并同步端口" Background="#2864DC" BorderBrush="#2864DC" Foreground="White" FontWeight="SemiBold" IsEnabled="False"/>
             </Grid>
-            <TextBlock x:Name="AutoHintText" Text="仅处理所选主机；获取端口后将请求管理员授权并自动同步。" Foreground="#61748D" FontSize="11" Margin="0,9,0,0" TextWrapping="Wrap"/>
+            <TextBlock x:Name="AutoHintText" Text="获取端口后先在 Terminal 执行 chmod g-w /root，成功后再同步本机配置。" Foreground="#61748D" FontSize="11" Margin="0,9,0,0" TextWrapping="Wrap"/>
             <TextBlock x:Name="CredentialStatusText" Text="正在读取登录凭据…" Foreground="#526780" FontSize="12" Margin="0,13,0,0" TextWrapping="Wrap"/>
             <Expander x:Name="LoginSettingsExpander" Header="登录设置" IsExpanded="False" Margin="0,10,0,0" Foreground="#455D78">
               <StackPanel Margin="0,12,0,0">
@@ -96,7 +96,8 @@
             </Expander>
           </StackPanel>
         </Border>
-        <TextBlock Text="手动更新端口" FontSize="18" FontWeight="SemiBold" Margin="1,0,0,12"/>
+        <TextBlock Text="手动更新端口" FontSize="18" FontWeight="SemiBold" Margin="1,0,0,6"/>
+        <TextBlock Text="按输入端口查找已运行的 Coder 工作区，执行 chmod g-w /root；需要保存 Coder 登录信息。" Foreground="#61748D" FontSize="11" Margin="2,0,0,12" TextWrapping="Wrap"/>
         <DockPanel Margin="1,1,1,12">
           <TextBlock x:Name="HostCountText" Text="目标主机" FontSize="16" FontWeight="SemiBold" DockPanel.Dock="Left"/>
           <TextBlock Text="留空即跳过 · 端口范围 1–65535" Foreground="#61748D" HorizontalAlignment="Right" VerticalAlignment="Center"/>
@@ -108,7 +109,7 @@
             <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
             <StackPanel Margin="0,0,15,0">
               <TextBlock x:Name="SelectionText" Text="填写端口后，在这里预览操作" FontWeight="SemiBold" Foreground="#304F79"/>
-              <TextBlock x:Name="PreviewText" Text="确认后自动备份 config，再使用管理员 PowerShell 清除对应记录。" Margin="0,7,0,0" Foreground="#566D8C" FontSize="12" TextWrapping="Wrap"/>
+              <TextBlock x:Name="PreviewText" Text="确认后先执行 chmod g-w /root，成功后备份并更新 config、清除对应记录。" Margin="0,7,0,0" Foreground="#566D8C" FontSize="12" TextWrapping="Wrap"/>
             </StackPanel>
             <Button x:Name="ApplyButton" Grid.Column="1" Content="确认手动更新" Background="#2864DC" BorderBrush="#2864DC" Foreground="White" FontSize="13" FontWeight="SemiBold" Padding="22,12" IsEnabled="False" VerticalAlignment="Center"/>
           </Grid>
@@ -120,7 +121,7 @@
     <Grid Grid.Row="2" Margin="0,20,0,0">
       <StackPanel VerticalAlignment="Center" Margin="0,0,15,0">
         <TextBlock x:Name="StatusText" Text="正在读取配置…" Foreground="#526780" TextWrapping="Wrap"/>
-        <TextBlock Text="本地同步会先备份 config，再使用管理员 PowerShell 清除对应的旧主机密钥记录。" FontSize="11" Foreground="#7C8BA0" Margin="0,5,0,0" TextWrapping="Wrap"/>
+        <TextBlock Text="远端权限命令成功后，备份并同步 config，再使用管理员 PowerShell 清理旧主机密钥记录。" FontSize="11" Foreground="#7C8BA0" Margin="0,5,0,0" TextWrapping="Wrap"/>
       </StackPanel>
     </Grid>
   </Grid>

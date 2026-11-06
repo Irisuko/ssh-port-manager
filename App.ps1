@@ -24,6 +24,9 @@ try {
     $script:appFolder = $PSScriptRoot
     $script:stage = $null
     $script:autoContext = $null
+    $script:preparationContext = $null
+    $script:preparationResults = @()
+    $script:preparationCompleted = $false
     $script:hasCredential = $false
     $script:lastProgress = ''
     $script:workspaceNames = @{}
@@ -46,7 +49,7 @@ try {
         } elseif ($script:AutoHostComboBox.Items.Count -eq 0) {
             $script:AutoHintText.Text = '当前配置中没有已绑定的主机。可在“管理主机与映射”中设置 SSH 主机与 Coder 工作区的对应关系。'
         } else {
-            $script:AutoHintText.Text = '仅处理所选主机；获取端口后将请求管理员授权并自动同步。其他手动填写的端口不会提交。'
+            $script:AutoHintText.Text = '仅处理所选主机；获取端口后先在 Terminal 执行 chmod g-w /root，成功后请求管理员授权并同步。其他手动填写的端口不会提交。'
         }
     }
 
@@ -68,6 +71,7 @@ try {
             if ($null -ne $savedCredential) { $savedCredential.Password.Dispose() }
         }
         Update-AutoControls
+        Update-Preview
     }
 
     function Update-Preview {
@@ -91,12 +95,15 @@ try {
                 continue
             }
             $count++
-            $row.Hint.Text = if ($port -eq $row.HostInfo.Port) { '端口不变，清除旧记录' } else { '将更新为 ' + $port }
+            $row.Hint.Text = if ($port -eq $row.HostInfo.Port) { '端口不变，执行权限命令并清理' } else { '将更新为 ' + $port }
             $lines.Add(('{0}：{1} → {2}' -f $row.HostInfo.Alias, $row.HostInfo.Port, $port))
+            $lines.Add('Coder Terminal：chmod g-w /root')
             $lines.Add(('ssh-keygen -R "[36.140.239.91]:{0}"' -f $port))
         }
         if (-not $valid) {
             $script:SelectionText.Text = '请修正标红的端口'
+        } elseif ($count -gt 0 -and -not $script:hasCredential) {
+            $script:SelectionText.Text = '请先保存 Coder 登录信息，以执行远端权限命令'
         } elseif ($count -gt 0) {
             $script:SelectionText.Text = '将处理 ' + $count + ' 个主机'
         } else {
@@ -105,9 +112,9 @@ try {
         $script:PreviewText.Text = if ($lines.Count -gt 0) {
             ($lines -join "`r`n") + "`r`n清理文件：" + $script:knownHostsPath
         } else {
-            '确认后自动备份 config，再使用管理员 PowerShell 清除对应记录。'
+            '确认后先在 Coder Terminal 执行 chmod g-w /root，成功后备份并更新 config、清除旧密钥记录。'
         }
-        $script:ApplyButton.IsEnabled = $valid -and ($count -gt 0) -and (-not $script:busy)
+        $script:ApplyButton.IsEnabled = $valid -and ($count -gt 0) -and $script:hasCredential -and (-not $script:busy)
     }
 
     function Read-Hosts([switch]$PreserveInputs) {
@@ -244,9 +251,18 @@ try {
     }
 
     function Get-RemoteSummary {
-        if ($null -eq $script:autoContext -or -not $script:autoContext.RemoteCompleted) { return '' }
-        $startText = if ($script:autoContext.Started) { '已启动' } else { '已运行' }
-        return ('远端工作区 {0} {1}，当前保持运行。{2} → 端口 {3}。' -f $script:autoContext.WorkspaceName, $startText, $script:autoContext.Alias, $script:autoContext.Port)
+        $lines = [Collections.Generic.List[string]]::new()
+        if ($null -ne $script:autoContext -and $script:autoContext.RemoteCompleted) {
+            $startText = if ($script:autoContext.Started) { '已启动' } else { '已运行' }
+            $lines.Add(('远端工作区 {0} {1}，当前保持运行。{2} → 端口 {3}。' -f $script:autoContext.WorkspaceName, $startText, $script:autoContext.Alias, $script:autoContext.Port))
+        }
+        foreach ($entry in @($script:preparationResults)) {
+            $prefix = if ($entry.Success) { '✓ ' } else { '✗ ' }
+            $lines.Add(($prefix + '{0} → {1}（端口 {2}）：chmod g-w /root' -f $entry.Alias, $entry.WorkspaceName, $entry.Port))
+            if ($entry.Success) { $lines.Add('/root 权限已确认：' + $entry.RootMode) }
+            elseif ($entry.Error) { $lines.Add([string]$entry.Error) }
+        }
+        return ($lines -join "`r`n")
     }
 
     function Show-LaunchFailure([Exception]$Exception) {
@@ -298,6 +314,7 @@ try {
     }
 
     function Start-ApplyUpdates([object[]]$Updates) {
+        if (-not $script:preparationCompleted) { throw '尚未确认远端权限命令成功，已阻止本地更新。' }
         # Revalidate the original UI snapshot immediately before requesting elevation.
         $null = New-PortUpdate -Document $script:document -Updates $Updates
         $currentDocument = Read-SshDocument -Path $script:configPath
@@ -333,7 +350,7 @@ try {
         # Keep other manually entered ports visible after automatic work; they were not submitted.
         if ($null -ne $script:autoContext) { Read-Hosts -PreserveInputs } else { Read-Hosts }
         $script:ResultText.Text = $log -join "`r`n"
-        if ($Result.Success) { Set-Status '已完成：端口已同步，对应的旧主机密钥记录已清除。' }
+        if ($Result.Success -and $script:preparationCompleted) { Set-Status '已完成：chmod g-w /root 已执行，端口已同步，旧主机密钥记录已清除。' }
         elseif ($Result.ConfigChanged) { Set-Status '端口已更新，但密钥清理未全部成功。请查看执行结果。' $true }
         else { Set-Status '本地同步未完成，请查看执行结果。' $true }
     }
@@ -357,24 +374,108 @@ try {
         }
         try {
             # The automatic path deliberately submits only its selected host, never manual rows.
-            $singleUpdate = [pscustomobject]@{ Id = $script:autoContext.HostId; Port = [string]$port }
-            Start-ApplyUpdates -Updates @($singleUpdate)
+            $singleUpdate = [pscustomobject]@{ Id = $script:autoContext.HostId; Port = [string]$port; WorkspaceName = $script:autoContext.WorkspaceName }
+            Start-PrepareUpdates -Updates @($singleUpdate)
         } catch { Show-LaunchFailure -Exception $_.Exception }
+    }
+
+    function Start-PrepareUpdates([object[]]$Updates) {
+        if (-not $script:hasCredential) { throw '请先在登录设置中保存 Coder 凭据，以执行 chmod g-w /root。' }
+        $null = New-PortUpdate -Document $script:document -Updates $Updates
+        $currentDocument = Read-SshDocument -Path $script:configPath
+        if ($currentDocument.Hash -ne $script:document.Hash) { throw '配置已被其他程序修改。请点击刷新后重新选择或填写；本次不会覆盖外部修改。' }
+        $targets = @{}
+        foreach ($hostInfo in @(Get-TargetHosts -Document $script:document)) { $targets[[string]$hostInfo.Id] = $hostInfo }
+        $entries = @()
+        $requestUpdates = @()
+        foreach ($update in $Updates) {
+            $workspaceName = ''
+            if ($null -ne $update.PSObject.Properties['WorkspaceName']) { $workspaceName = [string]$update.WorkspaceName }
+            $id = [string]$update.Id
+            $port = [string][int]$update.Port
+            $entries += [pscustomobject]@{Id=$id;Port=$port;Alias=[string]$targets[$id].Alias;WorkspaceName=$workspaceName}
+            $requestEntry = [ordered]@{Id=$id;Port=$port}
+            if ($workspaceName) { $requestEntry.WorkspaceName = $workspaceName }
+            $requestUpdates += [pscustomobject]$requestEntry
+        }
+        if ($entries.Count -eq 0) { return }
+        $script:preparationContext = [pscustomobject]@{ConfigHash=$script:document.Hash;Entries=$entries}
+        $script:preparationResults = @()
+        $script:preparationCompleted = $false
+        $request = [ordered]@{ConfigPath=$script:configPath;ExpectedHash=$script:document.Hash;Updates=$requestUpdates}
+        Set-Status '正在核对 Coder 工作区并执行 chmod g-w /root…'
+        $script:ResultText.Text = (Get-RemoteSummary) + "`r`n正在按端口核对工作区并执行远端权限命令；本地配置和密钥记录尚未修改。"
+        Start-Worker -Stage 'Prepare' -FileName 'Start-Prepare.ps1' -Request $request
+    }
+
+    function Complete-PrepareStage($Result) {
+        if ($null -eq $script:preparationContext -or $Result.Success -isnot [bool]) { throw '远端权限结果格式无效，已阻止本地更新。' }
+        $expected = @{}
+        foreach ($entry in $script:preparationContext.Entries) { $expected[$entry.Id] = $entry }
+        $seen = @{}
+        $validated = @()
+        foreach ($entry in @($Result.Results)) {
+            if ($null -eq $entry) { throw '远端权限结果缺少主机信息，已阻止本地更新。' }
+            $id = [string]$entry.Id
+            $portText = [string]$entry.Port
+            if (-not $expected.ContainsKey($id) -or $seen.ContainsKey($id) -or
+                $portText -cne $expected[$id].Port -or
+                -not [string]::Equals([string]$entry.Alias, $expected[$id].Alias, [StringComparison]::OrdinalIgnoreCase) -or
+                [string]$entry.Command -cne 'chmod g-w /root' -or $entry.Success -isnot [bool]) {
+                throw '远端权限结果与本次主机或端口不一致，已阻止本地更新。'
+            }
+            if ($entry.Success) {
+                if ([string]::IsNullOrWhiteSpace([string]$entry.WorkspaceName) -or
+                    ($expected[$id].WorkspaceName -and [string]$entry.WorkspaceName -cne $expected[$id].WorkspaceName) -or
+                    [string]$entry.RootMode -cnotmatch '^[0-7]{3,4}$' -or
+                    (([Convert]::ToInt32([string]$entry.RootMode, 8) -band 16) -ne 0)) {
+                    throw '未能确认目标工作区的 /root 权限，已阻止本地更新。'
+                }
+            }
+            $seen[$id] = $true
+            $validated += $entry
+        }
+        $script:preparationResults = $validated
+        if (-not $Result.Success) {
+            $script:ResultText.Text = (Get-RemoteSummary) + "`r`n远端权限处理未全部完成，本地配置和密钥记录未修改。`r`n" + [string]$Result.Error
+            Set-Status 'chmod g-w /root 未全部成功，本地同步未开始。' $true
+            return
+        }
+        if ($validated.Count -ne $expected.Count -or @($validated | Where-Object { -not $_.Success }).Count -gt 0) {
+            throw '远端权限结果不完整，已阻止本地更新。'
+        }
+        $returnedUpdates = @($Result.Updates)
+        if ($returnedUpdates.Count -ne $expected.Count) { throw '后台更新列表与本次选择不一致，已阻止本地更新。' }
+        $seenUpdates = @{}
+        foreach ($update in $returnedUpdates) {
+            $id = [string]$update.Id
+            if (-not $expected.ContainsKey($id) -or $seenUpdates.ContainsKey($id) -or [string]$update.Port -cne $expected[$id].Port) {
+                throw '后台更新列表与本次选择不一致，已阻止本地更新。'
+            }
+            $seenUpdates[$id] = $true
+        }
+        if ($script:document.Hash -cne $script:preparationContext.ConfigHash) { throw '本地配置快照已改变，请刷新后重新提交。' }
+        $script:preparationCompleted = $true
+        # Only the frozen selection, never a worker-supplied replacement, reaches elevation.
+        $updates = @($script:preparationContext.Entries | ForEach-Object { [pscustomobject]@{Id=$_.Id;Port=$_.Port} })
+        try { Start-ApplyUpdates -Updates $updates }
+        catch { Show-LaunchFailure -Exception $_.Exception }
     }
 
     $script:timer = [Windows.Threading.DispatcherTimer]::new()
     $script:timer.Interval = [TimeSpan]::FromMilliseconds(400)
     $script:timer.Add_Tick({
         if ($null -eq $script:worker) { return }
-        if ($script:stage -eq 'Coder') {
+        if ($script:stage -in @('Coder', 'Prepare')) {
             $progressPath = Join-Path $script:jobFolder 'progress.json'
             if ([IO.File]::Exists($progressPath)) {
                 try {
                     $progress = [IO.File]::ReadAllText($progressPath) | ConvertFrom-Json
                     if ($progress.Message -and [string]$progress.Message -ne $script:lastProgress) {
                         $script:lastProgress = [string]$progress.Message
-                        Set-Status ($script:autoContext.Alias + '：' + $script:lastProgress)
-                        $script:ResultText.Text = $script:autoContext.Alias + ' → ' + $script:autoContext.WorkspaceName + "`r`n" + $script:lastProgress + "`r`n本地 SSH 配置尚未修改。"
+                        $label = if ($null -ne $script:autoContext) { $script:autoContext.Alias + ' → ' + $script:autoContext.WorkspaceName } else { '手动端口 · 远端权限处理' }
+                        Set-Status ($label + '：' + $script:lastProgress)
+                        $script:ResultText.Text = $label + "`r`n" + $script:lastProgress + "`r`n本地 SSH 配置尚未修改。"
                     }
                 } catch { } # An atomic progress replacement may overlap a tick; retry next tick.
             }
@@ -393,10 +494,14 @@ try {
             if (-not [IO.File]::Exists($resultPath)) { throw ('后台进程未返回执行结果（退出码 ' + $completedWorker.ExitCode + '）。') }
             $result = [IO.File]::ReadAllText($resultPath) | ConvertFrom-Json
             if ($completedStage -eq 'Coder') { Complete-CoderStage -Result $result }
-            else { Show-ApplyResult -Result $result }
+            elseif ($completedStage -eq 'Prepare') { Complete-PrepareStage -Result $result }
+            elseif ($completedStage -eq 'Apply') { Show-ApplyResult -Result $result }
+            else { throw '后台阶段无效，无法确认执行结果。' }
         } catch {
             if ($completedStage -eq 'Coder') {
                 $script:ResultText.Text = $script:autoContext.Alias + ' → ' + $script:autoContext.WorkspaceName + "`r`n本地配置和密钥记录未修改；远端状态尚未确认，工作区可能仍在运行。`r`n" + $_.Exception.Message
+            } elseif ($completedStage -eq 'Prepare') {
+                $script:ResultText.Text = (Get-RemoteSummary) + "`r`n无法确认远端权限命令是否全部完成；本地配置和密钥记录未修改。`r`n" + $_.Exception.Message
             } else {
                 $script:ResultText.Text = (Get-RemoteSummary) + "`r`n无法确认本地修改是否完整完成。请刷新并检查配置及备份，不要直接重复提交。`r`n" + $_.Exception.Message
             }
@@ -404,7 +509,7 @@ try {
         } finally {
             $completedWorker.Dispose()
             Remove-JobFiles -Folder $completedFolder
-            # Never dispose or unlock a newly launched Apply worker here.
+            # Never dispose or unlock a newly launched preparation or Apply worker here.
             if ($null -eq $script:worker) { Set-Busy $false }
         }
     })
@@ -445,6 +550,9 @@ try {
             $selected = $script:AutoHostComboBox.SelectedItem
             if ($null -eq $selected) { return }
             if (-not $script:hasCredential) { throw '请先在登录设置中保存凭据。' }
+            $script:preparationContext = $null
+            $script:preparationResults = @()
+            $script:preparationCompleted = $false
             $currentDocument = Read-SshDocument -Path $script:configPath
             if ($currentDocument.Hash -ne $script:document.Hash) { throw '配置已被其他程序修改，请先点击刷新并重新选择主机。' }
             $script:autoContext = [pscustomobject]@{
@@ -475,6 +583,9 @@ try {
     $script:ApplyButton.Add_Click({
         if ($script:busy) { return }
         $script:autoContext = $null
+        $script:preparationContext = $null
+        $script:preparationResults = @()
+        $script:preparationCompleted = $false
         try {
             $updates = @()
             foreach ($row in $script:rows) {
@@ -483,7 +594,7 @@ try {
             }
             if ($updates.Count -eq 0) { return }
             Set-Busy $true
-            Start-ApplyUpdates -Updates $updates
+            Start-PrepareUpdates -Updates $updates
         } catch {
             Show-LaunchFailure -Exception $_.Exception
             Set-Busy $false

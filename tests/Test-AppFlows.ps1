@@ -53,11 +53,30 @@ try {
         # No process or UAC is launched. The mock captures the real request built by the UI.
         function Start-Worker([string]$Stage, [string]$FileName, [Collections.IDictionary]$Request, [bool]$Elevated = $false) {
             $script:callCount++
+            $script:capturedStage = $Stage
+            $script:capturedFileName = $FileName
             $script:capturedRequest = $Request
             $script:capturedElevated = $Elevated
             $script:worker = [pscustomobject]@{ HasExited = $false; Disposed = $false }
             $script:worker | Add-Member ScriptMethod Dispose { $this.Disposed = $true }
             $script:stage = $Stage
+        }
+
+        function New-PreparationResult {
+            $results = @()
+            $updates = @()
+            foreach ($entry in $script:preparationContext.Entries) {
+                $workspace = if ($entry.WorkspaceName) { $entry.WorkspaceName } else { 'PortDiscoveredWorkspace' }
+                $results += [pscustomobject]@{Id=$entry.Id;Alias=$entry.Alias;Port=$entry.Port;WorkspaceName=$workspace;Command='chmod g-w /root';Success=$true;RootMode='755';Error=$null}
+                $updates += [pscustomobject]@{Id=$entry.Id;Port=$entry.Port}
+            }
+            [pscustomobject]@{Success=$true;Error=$null;Updates=$updates;Results=$results}
+        }
+
+        function Assert-Throws([scriptblock]$Action, [string]$Message) {
+            $caught = $false
+            try { & $Action } catch { $caught = $true }
+            Assert-Check $caught $Message
         }
 
         $script:autoContext = [pscustomobject]@{
@@ -80,15 +99,42 @@ try {
         Set-Busy $true
         Assert-Check (-not $script:ManageHostsButton.IsEnabled) 'Host manager must be unavailable during a running job.'
         Complete-CoderStage $coderResult
-        Assert-Check ($script:callCount -eq 1 -and $script:capturedElevated) 'Coder success must hand off to elevated Apply.'
+        Assert-Check ($script:callCount -eq 1 -and -not $script:capturedElevated -and $script:capturedStage -eq 'Prepare' -and $script:capturedFileName -eq 'Start-Prepare.ps1') 'Coder success must first launch a normal-user Terminal preparation worker.'
         Assert-Check (@($script:capturedRequest.Updates).Count -eq 1) 'Automatic apply submitted another manual row.'
         Assert-Check ([string]$script:capturedRequest.Updates[0].Id -eq $script:autoContext.HostId) 'Automatic update has the wrong host.'
+        Assert-Check ($script:capturedRequest.Updates[0].WorkspaceName -ceq 'PyramidKV') 'Auto Terminal preparation lost the frozen workspace identity.'
         Assert-Check ($script:rows[0].Input.Text -eq '41234' -and $script:rows[1].Input.Text -eq '33333') 'Retrieved port display or manual input preservation failed.'
+
+        $forged = New-PreparationResult
+        $forged.Results[0].Port = '41235'
+        Assert-Throws { Complete-PrepareStage $forged } 'Wrong Terminal result port must be rejected.'
+        $forged = New-PreparationResult
+        $forged.Results[0].WorkspaceName = 'AnotherWorkspace'
+        Assert-Throws { Complete-PrepareStage $forged } 'Wrong automatic workspace must be rejected.'
+        $forged = New-PreparationResult
+        $forged.Results[0].RootMode = '775'
+        Assert-Throws { Complete-PrepareStage $forged } 'Group-writable root must not allow local Apply.'
+        $forged = New-PreparationResult
+        $forged.Updates[0].Id = 'unselected'
+        Assert-Throws { Complete-PrepareStage $forged } 'Forged update selection must be rejected.'
+        $forged = New-PreparationResult
+        $forged.Results[0].Command = 'true'
+        Assert-Throws { Complete-PrepareStage $forged } 'A different remote command must never authorize local Apply.'
+        $forged = New-PreparationResult
+        $forged.Results = @()
+        Assert-Throws { Complete-PrepareStage $forged } 'Claimed success without per-host Terminal evidence must fail.'
+        Assert-Check ($script:callCount -eq 1) 'Invalid Terminal results launched another worker.'
+
+        $prepared = New-PreparationResult
+        Complete-PrepareStage $prepared
+        Assert-Check ($script:callCount -eq 2 -and $script:capturedElevated -and $script:capturedStage -eq 'Apply') 'Only verified Terminal success may launch elevated Apply.'
+        Assert-Check (@($script:capturedRequest.Updates).Count -eq 1 -and $script:capturedRequest.Updates[0].Id -ceq $script:autoContext.HostId) 'Terminal handoff changed the selected local update.'
+        Assert-Check ($script:ResultText.Text.Contains('chmod g-w /root') -and $script:ResultText.Text.Contains('755')) 'Awaiting-UAC output must retain successful Terminal evidence.'
 
         $script:worker = $null
         [IO.File]::AppendAllText($script:configPath, "# external edit`r`n")
         Complete-CoderStage $coderResult
-        Assert-Check ($script:callCount -eq 1) 'Config hash conflict still launched Apply.'
+        Assert-Check ($script:callCount -eq 2) 'Config hash conflict still launched preparation.'
         Assert-Check ($script:ResultText.Text.Contains('41234') -and $script:ResultText.Text.Contains('配置已被其他程序修改')) 'Hash conflict lost remote/port context.'
         [IO.File]::WriteAllText($script:configPath, $fixture)
         Read-Hosts -PreserveInputs
@@ -102,12 +148,72 @@ try {
         Set-Busy $true
         & $script:tickCheck
         Assert-Check ($script:completed.Disposed) 'Completed Coder worker was not disposed.'
-        Assert-Check ($null -ne $script:worker -and -not $script:worker.Disposed -and $script:stage -eq 'Apply' -and $script:busy) 'Timer disposed or unlocked the newly launched Apply worker.'
+        Assert-Check ($null -ne $script:worker -and -not $script:worker.Disposed -and $script:stage -eq 'Prepare' -and $script:busy) 'Timer disposed or unlocked the newly launched preparation worker.'
+        $prepared = New-PreparationResult
+        $script:completed = [pscustomobject]@{ HasExited = $true; ExitCode = 0; Disposed = $false }
+        $script:completed | Add-Member ScriptMethod Dispose { $this.Disposed = $true }
+        $script:worker = $script:completed
+        $script:stage = 'Prepare'
+        $script:jobFolder = $fixtureFolder
+        [IO.File]::WriteAllText((Join-Path $fixtureFolder 'result.json'), ($prepared | ConvertTo-Json -Depth 5))
+        & $script:tickCheck
+        Assert-Check ($script:completed.Disposed -and $script:stage -eq 'Apply' -and -not $script:worker.Disposed -and $script:busy) 'Timer did not preserve the Prepare-to-Apply handoff.'
 
         $script:worker = $null
         function Start-Worker { throw [ComponentModel.Win32Exception]::new(1223) }
-        Complete-CoderStage $coderResult
-        Assert-Check ($script:ResultText.Text.Contains('已取消本地同步') -and $script:ResultText.Text.Contains('41234') -and $script:ResultText.Text.Contains('当前保持运行')) 'UAC cancellation lost remote or port state.'
+        Complete-PrepareStage $prepared
+        Assert-Check ($script:ResultText.Text.Contains('已取消本地同步') -and $script:ResultText.Text.Contains('41234') -and $script:ResultText.Text.Contains('当前保持运行') -and $script:ResultText.Text.Contains('chmod g-w /root')) 'UAC cancellation lost remote command or port state.'
+
+        # Manual mode discovers each running workspace by the supplied port, without starting it.
+        function Start-Worker([string]$Stage, [string]$FileName, [Collections.IDictionary]$Request, [bool]$Elevated = $false) {
+            $script:callCount++
+            $script:capturedStage = $Stage
+            $script:capturedFileName = $FileName
+            $script:capturedRequest = $Request
+            $script:capturedElevated = $Elevated
+        }
+        $script:worker = $null
+        Set-Busy $false
+        Read-Hosts
+        $blankCallCount = $script:callCount
+        $script:ApplyButton.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
+        Assert-Check ($script:callCount -eq $blankCallCount) 'Blank manual ports must not launch any work.'
+        $script:rows[0].Input.Text = '41000'
+        $script:rows[1].Input.Text = '42000'
+        $script:hasCredential = $false
+        Update-Preview
+        Assert-Check (-not $script:ApplyButton.IsEnabled -and $script:SelectionText.Text.Contains('Coder')) 'Manual mode must explain its login prerequisite.'
+        $script:ApplyButton.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
+        Assert-Check ($script:callCount -eq $blankCallCount) 'Manual mode launched Terminal work without credentials.'
+        $script:hasCredential = $true
+        Update-Preview
+        Assert-Check ($script:ApplyButton.IsEnabled) 'Saving credentials should enable a valid manual selection.'
+        $script:ApplyButton.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
+        Assert-Check ($script:capturedStage -eq 'Prepare' -and -not $script:capturedElevated -and $script:capturedFileName -eq 'Start-Prepare.ps1') 'Manual click must only launch normal-user Terminal preparation.'
+        Assert-Check (@($script:capturedRequest.Updates).Count -eq 2 -and $null -eq $script:capturedRequest.Updates[0].PSObject.Properties['WorkspaceName']) 'Manual selection must omit blank rows and discover by port rather than a binding.'
+        $partial = New-PreparationResult
+        $partial.Success = $false
+        $partial.Error = 'fixture Terminal failure'
+        $partial.Results[1].Success = $false
+        $partial.Results[1].RootMode = ''
+        $partial.Results[1].Error = 'fixture rejected'
+        $beforePartial = $script:callCount
+        Complete-PrepareStage $partial
+        Assert-Check ($script:callCount -eq $beforePartial -and -not $script:preparationCompleted) 'Partial Terminal failure must block every local change.'
+        Assert-Check ($script:ResultText.Text.Contains('fixture rejected') -and $script:ResultText.Text.Contains('755') -and $script:ResultText.Text.Contains('本地配置和密钥记录未修改')) 'Partial Terminal report must retain successes and failures.'
+        Assert-Check ($script:rows[0].Input.Text -eq '41000' -and $script:rows[1].Input.Text -eq '42000') 'Terminal failure discarded manual inputs.'
+        $prepared = New-PreparationResult
+        [IO.File]::AppendAllText($script:configPath, "# changed during Terminal work`r`n")
+        Complete-PrepareStage $prepared
+        Assert-Check ($script:callCount -eq $beforePartial -and $script:ResultText.Text.Contains('配置已被其他程序修改')) 'Post-Terminal config hash guard failed.'
+        [IO.File]::WriteAllText($script:configPath, $fixture)
+        Read-Hosts -PreserveInputs
+        Complete-PrepareStage $prepared
+        Assert-Check ($script:capturedStage -eq 'Apply' -and $script:capturedElevated -and @($script:capturedRequest.Updates).Count -eq 2) 'Manual Terminal success must hand all frozen selected rows to local Apply.'
+        $successApply = [pscustomobject]@{Success=$true;ConfigChanged=$false;BackupPath=$null;KnownHostsBackupPath=$null;Results=@();Error=$null}
+        Show-ApplyResult $successApply
+        Assert-Check ($script:StatusText.Text.Contains('chmod g-w /root') -and $script:ResultText.Text.Contains('41000') -and $script:ResultText.Text.Contains('42000')) 'Final success must identify the remote command and each manual endpoint.'
+        Set-Busy $false
 
         $renamedFixture = $fixture.Replace('MuxWise-plugin', 'DifferentHost')
         [IO.File]::WriteAllText($script:configPath, $renamedFixture)
@@ -165,7 +271,7 @@ try {
         Assert-Check ($script:ResultText.Text.Contains('手动更新不受影响')) 'Mapping load error was not clearly separated from manual updates.'
 
         $script:timer.Stop()
-        'PASS: WPF options, automatic handoff/hash/cancel guards, stable manual inputs, dynamic mapping snapshots, and manual fallback for corrupt mappings.'
+        'PASS: WPF auto/manual Terminal preparation, credential gates, frozen selection/result checks, partial failures, hash/UAC guards, worker handoffs, stable inputs, and dynamic mapping behavior.'
     }.ToString()
     & ([scriptblock]::Create($body + "`r`n" + $checks))
 } finally {
