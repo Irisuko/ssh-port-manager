@@ -45,10 +45,18 @@ try {
         Assert-Check ($script:AutoHostComboBox.SelectedIndex -eq -1) 'Automatic default selection must be empty.'
         Assert-Check ($script:rows.Count -eq 3) 'Unmapped target host must remain available for manual editing.'
         Assert-Check (-not $script:StartSyncButton.IsEnabled) 'Automatic action must require an explicit selection.'
+        Assert-Check ($script:CheckHostComboBox.Items.Count -eq 3 -and $script:CheckHostComboBox.SelectedIndex -eq -1 -and -not $script:CheckConnectButton.IsEnabled) 'Check action must offer every literal host and require explicit selection.'
         $script:AutoHostComboBox.SelectedIndex = 0
         $selected = $script:AutoHostComboBox.SelectedItem
         $script:rows[1].Input.Text = '33333'
         $script:callCount = 0
+        $script:vsCodeCalls = @()
+        function Open-SshInVSCode([string]$Alias) {
+            $script:vsCodeCalls += $Alias
+            [pscustomobject]@{Launched=$true;Path='fixture-code.exe';Error=$null}
+        }
+        $wire = [byte[]](@(0,0,0,11) + [Text.Encoding]::ASCII.GetBytes('ssh-ed25519') + @(0,0,0,32) + (1..32))
+        $script:fixtureHostKey = [pscustomobject]@{Algorithm='ssh-ed25519';Key=[Convert]::ToBase64String($wire)}
 
         # No process or UAC is launched. The mock captures the real request built by the UI.
         function Start-Worker([string]$Stage, [string]$FileName, [Collections.IDictionary]$Request, [bool]$Elevated = $false) {
@@ -67,10 +75,54 @@ try {
             $updates = @()
             foreach ($entry in $script:preparationContext.Entries) {
                 $workspace = if ($entry.WorkspaceName) { $entry.WorkspaceName } else { 'PortDiscoveredWorkspace' }
-                $results += [pscustomobject]@{Id=$entry.Id;Alias=$entry.Alias;Port=$entry.Port;WorkspaceName=$workspace;Command='chmod g-w /root';Success=$true;RootMode='755';Error=$null}
+                $results += [pscustomobject]@{Id=$entry.Id;Alias=$entry.Alias;Port=$entry.Port;WorkspaceName=$workspace;Command='chmod g-w /root';Success=$true;Outcome='Prepared';Ready=$true;CommandExecuted=$true;RootMode='755';HostKeys=@($script:fixtureHostKey);Error=$null}
                 $updates += [pscustomobject]@{Id=$entry.Id;Port=$entry.Port}
             }
-            [pscustomobject]@{Success=$true;Error=$null;Updates=$updates;Results=$results}
+            [pscustomobject]@{Success=$true;CanApply=$true;Deferred=$false;Error=$null;Updates=$updates;Results=$results}
+        }
+
+        function New-ApplyResult {
+            $results = @($script:preparationContext.Entries | ForEach-Object { [pscustomobject]@{Endpoint=('[36.140.239.91]:' + $_.Port);Success=$true;Command='ssh-keygen -R';Output='fixture removed';KeyAdded=$true;AddedKeys=1;KeyPending=$false} })
+            [pscustomobject]@{Success=$true;ConfigChanged=$false;BackupPath=$null;KnownHostsBackupPath=$null;Results=$results;Error=$null}
+        }
+
+        function Invoke-CapturedCoderJob([int]$Port = 41234) {
+            # Exercise the real UI -> JSON -> CoderJob schema, replacing only network I/O.
+            Import-Module (Join-Path $project 'CoderJob.psm1') -Force
+            $request = $script:capturedRequest | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+            $password = ConvertTo-SecureString 'isolated-fixture-password' -AsPlainText -Force
+            $credential = [Management.Automation.PSCredential]::new('fixture@example.invalid', $password)
+            $network = {
+                param($Alias,$Credential,$OnProgress,$TimeoutSeconds,$RequireAlreadyRunning,$AllowUnreadyPort)
+                if ($request.Mode -eq 'Check' -and -not $RequireAlreadyRunning) { throw 'Check mode lost its no-start guard.' }
+                if ($request.Mode -eq 'Auto' -and -not $AllowUnreadyPort) { throw 'Auto mode lost pending-port support.' }
+                [pscustomobject]@{WorkspaceName='PyramidKV';Port=$Port;Started=$false;Status='running';Deferred=$false}
+            }.GetNewClosure()
+            try {
+                $result = Invoke-CoderJob -Request $request -Credential $credential -Mappings @{'pyramidkv-plugin'='PyramidKV'} -StartWorkspace $network
+                Assert-Check $result.Success ('Actual CoderJob rejected the UI request: ' + $result.Error)
+                return $result
+            } finally { $password.Dispose() }
+        }
+
+        function Invoke-CapturedPreparationJob {
+            Import-Module (Join-Path $project 'PreparationJob.psm1') -Force
+            $request = $script:capturedRequest | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+            $password = ConvertTo-SecureString 'isolated-fixture-password' -AsPlainText -Force
+            $credential = [Management.Automation.PSCredential]::new('fixture@example.invalid', $password)
+            $hostKey = $script:fixtureHostKey
+            $network = {
+                param($Port,$Credential,$OnProgress,$Mode,$WaitSeconds,$DeadlineUtc,$TimeoutSeconds,$WorkspaceName)
+                if ($Mode -cne $request.Mode) { throw 'Preparation lost the selected operation mode.' }
+                if ($Mode -eq 'Check' -and $WaitSeconds -ne 0) { throw 'Check must not wait for startup.' }
+                if (-not $WorkspaceName) { $WorkspaceName='PortDiscoveredWorkspace' }
+                [pscustomobject]@{WorkspaceName=$WorkspaceName;Port=$Port;Command='chmod g-w /root';Outcome='Prepared';Ready=$true;CommandExecuted=$true;RootMode='755';ExitCode=0;HostKeys=@($hostKey)}
+            }.GetNewClosure()
+            try {
+                $result = Invoke-PreparationJob -Request $request -Credential $credential -PrepareWorkspace $network
+                Assert-Check $result.Success ('Actual PreparationJob rejected the UI request: ' + $result.Error)
+                return $result
+            } finally { $password.Dispose() }
         }
 
         function Assert-Throws([scriptblock]$Action, [string]$Message) {
@@ -121,6 +173,9 @@ try {
         $forged.Results[0].Command = 'true'
         Assert-Throws { Complete-PrepareStage $forged } 'A different remote command must never authorize local Apply.'
         $forged = New-PreparationResult
+        $forged.Results[0].HostKeys = @([pscustomobject]@{Algorithm='ssh-ed25519';Key='AAAA'})
+        Assert-Throws { Complete-PrepareStage $forged } 'Malformed or forged public key wire data must never authorize local Apply.'
+        $forged = New-PreparationResult
         $forged.Results = @()
         Assert-Throws { Complete-PrepareStage $forged } 'Claimed success without per-host Terminal evidence must fail.'
         Assert-Check ($script:callCount -eq 1) 'Invalid Terminal results launched another worker.'
@@ -129,6 +184,7 @@ try {
         Complete-PrepareStage $prepared
         Assert-Check ($script:callCount -eq 2 -and $script:capturedElevated -and $script:capturedStage -eq 'Apply') 'Only verified Terminal success may launch elevated Apply.'
         Assert-Check (@($script:capturedRequest.Updates).Count -eq 1 -and $script:capturedRequest.Updates[0].Id -ceq $script:autoContext.HostId) 'Terminal handoff changed the selected local update.'
+        Assert-Check ($script:capturedRequest.Updates[0].AddHostKeys -eq $true -and @($script:capturedRequest.Updates[0].HostKeys).Count -eq 1) 'Prepared handoff must explicitly request installation of validated host public keys.'
         Assert-Check ($script:ResultText.Text.Contains('chmod g-w /root') -and $script:ResultText.Text.Contains('755')) 'Awaiting-UAC output must retain successful Terminal evidence.'
 
         $script:worker = $null
@@ -193,8 +249,13 @@ try {
         Assert-Check (@($script:capturedRequest.Updates).Count -eq 2 -and $null -eq $script:capturedRequest.Updates[0].PSObject.Properties['WorkspaceName']) 'Manual selection must omit blank rows and discover by port rather than a binding.'
         $partial = New-PreparationResult
         $partial.Success = $false
+        $partial.CanApply = $false
         $partial.Error = 'fixture Terminal failure'
         $partial.Results[1].Success = $false
+        $partial.Results[1].Outcome = 'Failed'
+        $partial.Results[1].Ready = $false
+        $partial.Results[1].CommandExecuted = $false
+        $partial.Results[1].HostKeys = @()
         $partial.Results[1].RootMode = ''
         $partial.Results[1].Error = 'fixture rejected'
         $beforePartial = $script:callCount
@@ -210,9 +271,111 @@ try {
         Read-Hosts -PreserveInputs
         Complete-PrepareStage $prepared
         Assert-Check ($script:capturedStage -eq 'Apply' -and $script:capturedElevated -and @($script:capturedRequest.Updates).Count -eq 2) 'Manual Terminal success must hand all frozen selected rows to local Apply.'
-        $successApply = [pscustomobject]@{Success=$true;ConfigChanged=$false;BackupPath=$null;KnownHostsBackupPath=$null;Results=@();Error=$null}
+        $successApply = New-ApplyResult
         Show-ApplyResult $successApply
         Assert-Check ($script:StatusText.Text.Contains('chmod g-w /root') -and $script:ResultText.Text.Contains('41000') -and $script:ResultText.Text.Contains('42000')) 'Final success must identify the remote command and each manual endpoint.'
+        Assert-Check ($script:vsCodeCalls.Count -eq 0) 'Manual or automatic synchronization must not open VS Code.'
+        Set-Busy $false
+
+        # Both network phases share the initial deadline, rather than each waiting three minutes.
+        Read-Hosts
+        Reset-Operation -Mode 'Sync'
+        $script:readinessDeadline = [DateTime]::UtcNow.AddSeconds(40)
+        Start-CoderSelection -Selected $script:AutoHostComboBox.Items[0]
+        $initialDeadline = $script:capturedRequest.DeadlineUtc
+        Assert-Check ($script:capturedRequest.Mode -eq 'Auto' -and $script:capturedRequest.TimeoutSeconds -le 40 -and $script:capturedRequest.TimeoutSeconds -gt 0) 'Automatic Coder phase must receive its Auto mode and the remaining global readiness budget.'
+        Complete-CoderStage (Invoke-CapturedCoderJob)
+        Assert-Check ($script:capturedRequest.WaitSeconds -le 40 -and $script:capturedRequest.WaitSeconds -gt 0 -and $script:capturedRequest.DeadlineUtc -ceq $initialDeadline) 'Preparation reset or lost the global deadline.'
+        $script:autoContext.Deferred=$true; $script:autoContext.Status='starting'
+        Assert-Check ((Get-RemoteSummary).Contains('仍在等待') -and -not (Get-RemoteSummary).Contains('已运行')) 'Pending Coder builds must not be reported as running servers.'
+        Complete-PrepareStage (Invoke-CapturedPreparationJob)
+        Assert-Check ((Get-RemoteSummary).Contains('已就绪') -and -not (Get-RemoteSummary).Contains('仍在等待')) 'A later verified preparation must replace the stale waiting status.'
+        Show-ApplyResult (New-ApplyResult)
+        Assert-Check ($script:vsCodeCalls.Count -eq 0) 'Automatic successful preparation must not open VS Code.'
+        Set-Busy $false
+
+        # A positively verified unavailable server may defer chmod, but never claim it ran.
+        Read-Hosts
+        Reset-Operation -Mode 'Sync'
+        Start-PrepareUpdates -Updates @([pscustomobject]@{Id=[string]$script:rows[0].HostInfo.Id;Port='41234'})
+        $deferred = New-PreparationResult
+        $deferred.Deferred = $true
+        $deferred.Results[0].Outcome = 'Deferred'
+        $deferred.Results[0].Ready = $false
+        $deferred.Results[0].CommandExecuted = $false
+        $deferred.Results[0].RootMode = ''
+        $deferred.Results[0].HostKeys = @()
+        $deferred.Results[0].Error = 'fixture waiting for GPU'
+        Assert-Throws { Complete-PrepareStage $deferred } 'A worker may not claim a deadline deferral before the global wait expires.'
+        $script:preparationContext.DeadlineUtc = [DateTime]::UtcNow.AddSeconds(-1)
+        $beforeDeferred = $script:callCount
+        Complete-PrepareStage $deferred
+        Assert-Check ($script:callCount -eq $beforeDeferred + 1 -and $script:capturedStage -eq 'Apply' -and $script:capturedElevated) 'Verified not-ready deadline must still hand port synchronization and cleanup to Apply.'
+        Assert-Check ($script:capturedRequest.Updates[0].AddHostKeys -eq $false -and @($script:capturedRequest.Updates[0].HostKeys).Count -eq 0) 'Deferred cleanup must not install empty or unverified host keys.'
+        $deferredApply = New-ApplyResult
+        $deferredApply.Results[0].KeyAdded = $false
+        $deferredApply.Results[0].AddedKeys = 0
+        $deferredApply.Results[0].KeyPending = $true
+        Show-ApplyResult $deferredApply
+        Assert-Check ($script:StatusText.Text.Contains('待服务器就绪') -and -not $script:StatusText.Text.Contains('已执行') -and $script:ResultText.Text.Contains('待处理')) 'Deferred local success falsely reported successful chmod or fully completed keys.'
+        Assert-Check ($script:vsCodeCalls.Count -eq 0) 'Deferred synchronization must not open VS Code.'
+        Set-Busy $false
+
+        # The new button never starts a stopped mapped workspace or submits other manual inputs.
+        Read-Hosts
+        $script:CheckHostComboBox.SelectedIndex = 0
+        $script:rows[1].Input.Text = '33333'
+        $script:CheckConnectButton.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
+        Assert-Check ($script:capturedStage -eq 'Coder' -and $script:capturedRequest.Mode -eq 'Check' -and -not $script:capturedElevated) 'Mapped check must call Coder in explicit no-start check mode.'
+        $beforeNotRunning = $script:callCount
+        Complete-CoderStage ([pscustomobject]@{Success=$false;NotReady=$true;Error='fixture stopped'})
+        Assert-Check ($script:callCount -eq $beforeNotRunning -and $script:vsCodeCalls.Count -eq 0 -and $script:StatusText.Text.Contains('未启动服务器')) 'Stopped check must not prepare, elevate, start a workspace, or open VS Code.'
+        Set-Busy $false
+        $script:CheckConnectButton.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
+        $freshCoder = Invoke-CapturedCoderJob -Port 45123
+        Complete-CoderStage $freshCoder
+        Assert-Check ($script:capturedStage -eq 'Prepare' -and $script:capturedRequest.Mode -eq 'Check' -and $script:capturedRequest.WaitSeconds -eq 0 -and @($script:capturedRequest.Updates).Count -eq 1 -and $script:capturedRequest.Updates[0].Port -eq '45123') 'Mapped check must refresh exactly the selected host port and check readiness immediately.'
+        Assert-Check ($script:rows[1].Input.Text -eq '33333') 'Check changed another manual input.'
+        $notReady = New-PreparationResult
+        $notReady.Success=$false; $notReady.CanApply=$false
+        $notReady.Results[0].Success=$false; $notReady.Results[0].Outcome='NotReady'; $notReady.Results[0].Ready=$false
+        $notReady.Results[0].CommandExecuted=$false; $notReady.Results[0].RootMode=''; $notReady.Results[0].HostKeys=@()
+        $beforeNotReady = $script:callCount
+        Complete-PrepareStage $notReady
+        Assert-Check ($script:callCount -eq $beforeNotReady -and $script:vsCodeCalls.Count -eq 0 -and -not $script:preparationCompleted) 'Agent-not-ready check must not modify local files or open VS Code.'
+        $illegalDeferred = New-PreparationResult
+        $illegalDeferred.Deferred=$true; $illegalDeferred.Results[0].Outcome='Deferred'
+        $illegalDeferred.Results[0].Ready=$false; $illegalDeferred.Results[0].CommandExecuted=$false
+        $illegalDeferred.Results[0].RootMode=''; $illegalDeferred.Results[0].HostKeys=@()
+        Assert-Throws { Complete-PrepareStage $illegalDeferred } 'Check mode must not accept a deferred local update.'
+        Complete-PrepareStage (New-PreparationResult)
+        Assert-Check ($script:vsCodeCalls.Count -eq 0) 'VS Code must not open before elevated key installation completes.'
+        $missingKeys = New-ApplyResult
+        $missingKeys.Results[0].KeyAdded=$false; $missingKeys.Results[0].AddedKeys=0
+        Show-ApplyResult $missingKeys
+        Assert-Check ($script:vsCodeCalls.Count -eq 0 -and $script:StatusText.Text.Contains('无法确认新主机密钥')) 'An unconfirmed host key installation must block VS Code.'
+        $wrongEndpoint = New-ApplyResult
+        $wrongEndpoint.Results[0].Endpoint='[36.140.239.91]:49999'
+        Show-ApplyResult $wrongEndpoint
+        Assert-Check ($script:vsCodeCalls.Count -eq 0) 'Unrelated endpoint key evidence must not authorize VS Code.'
+        Show-ApplyResult (New-ApplyResult)
+        Assert-Check ($script:vsCodeCalls.Count -eq 1 -and $script:vsCodeCalls[0] -ceq 'pyramidkv-plugin') 'Completed mapped check must open VS Code for its frozen SSH alias.'
+        Set-Busy $false
+
+        # An unmapped host is checked by its current config port, without any Coder start stage.
+        Read-Hosts
+        $script:CheckHostComboBox.SelectedIndex = 2
+        $script:rows[0].Input.Text = '49998'
+        $script:CheckConnectButton.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
+        Assert-Check ($script:capturedStage -eq 'Prepare' -and $script:capturedRequest.Mode -eq 'Check' -and $script:capturedRequest.WaitSeconds -eq 0 -and @($script:capturedRequest.Updates).Count -eq 1 -and $script:capturedRequest.Updates[0].Port -eq '31003' -and -not $script:capturedElevated) 'Unmapped check must immediately prepare only the current configured endpoint.'
+        Complete-PrepareStage (Invoke-CapturedPreparationJob)
+        $failedApply = New-ApplyResult
+        $failedApply.Success=$false; $failedApply.Results[0].Success=$false
+        Show-ApplyResult $failedApply
+        Assert-Check ($script:vsCodeCalls.Count -eq 1) 'Failed local apply must not open VS Code.'
+        Show-ApplyResult (New-ApplyResult)
+        Assert-Check ($script:vsCodeCalls.Count -eq 2 -and $script:vsCodeCalls[1] -ceq 'ManualOnly') 'Unmapped ready check must launch the selected literal alias only after key apply succeeds.'
+        Assert-Check ($script:rows[0].Input.Text -eq '49998') 'Unmapped check discarded unrelated manual inputs.'
         Set-Busy $false
 
         $renamedFixture = $fixture.Replace('MuxWise-plugin', 'DifferentHost')
@@ -271,7 +434,7 @@ try {
         Assert-Check ($script:ResultText.Text.Contains('手动更新不受影响')) 'Mapping load error was not clearly separated from manual updates.'
 
         $script:timer.Stop()
-        'PASS: WPF auto/manual Terminal preparation, credential gates, frozen selection/result checks, partial failures, hash/UAC guards, worker handoffs, stable inputs, and dynamic mapping behavior.'
+        'PASS: WPF auto/manual/check flows, shared readiness deadlines, deferred cleanup, strict key proofs, no-start checks, VS Code gating, credential/hash/UAC guards, worker handoffs, stable inputs, and dynamic mappings.'
     }.ToString()
     & ([scriptblock]::Create($body + "`r`n" + $checks))
 } finally {

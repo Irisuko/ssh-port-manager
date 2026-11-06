@@ -173,6 +173,58 @@ foreach ($status in @('pending', 'starting')) {
 }
 Pass 'pending and starting builds are joined without duplicate starts'
 
+foreach ($status in @('pending','starting')) {
+    $allocated=New-Build -Status $status -Id 'build-new' -Port 32123
+    $transport=New-Transport (@(Get-Prefix (New-Workspace $allocated)) + @(
+        (New-Step 'GET' '/api/v2/workspacebuilds/build-new' $allocated),
+        (New-Step 'GET' '/api/v2/workspaces/workspace-pyramid' (New-Workspace $allocated))
+    ))
+    $result=Invoke-CoderWorkspace -Mappings $defaultMappings -Alias 'PyramidKV-plugin' -Credential $credential -RequestHandler $transport.Handler -PollIntervalMilliseconds 1 -AllowUnreadyPort
+    Assert-Equal $result.Port 32123 'only current build allocated port is returned while waiting'
+    Assert-Equal $result.Status $status 'unready status stays explicit'
+    Assert-Equal $result.Deferred $true 'unready port requires deferred preparation'
+    Assert-Equal $result.Started $false 'reading an existing allocated build never starts again'
+    Assert-Transport $transport
+}
+Pass 'current pending and starting builds can hand off verified allocated ports without claiming readiness'
+
+$allocated=New-Build -Status 'pending' -Id 'build-new' -Port 32123
+$transport=New-Transport (@(Get-Prefix (New-Workspace $stopped)) + @(
+    (New-Step 'POST' '/api/v2/workspaces/workspace-pyramid/builds' $allocated),
+    (New-Step 'GET' '/api/v2/workspacebuilds/build-new' $allocated),
+    (New-Step 'GET' '/api/v2/workspaces/workspace-pyramid' (New-Workspace $allocated))
+))
+$result=Invoke-CoderWorkspace -Mappings $defaultMappings -Alias 'PyramidKV-plugin' -Credential $credential -RequestHandler $transport.Handler -PollIntervalMilliseconds 1 -AllowUnreadyPort
+Assert-True ($result.Started -and $result.Deferred -and $result.Port -eq 32123) 'A newly started pending build must use its own allocated metadata instead of the stopped port.'
+Assert-Transport $transport
+$replacement=New-Build -Status 'pending' -Id 'replacement' -Port 32124
+$transport=New-Transport (@(Get-Prefix (New-Workspace $allocated)) + @(
+    (New-Step 'GET' '/api/v2/workspacebuilds/build-new' $allocated),
+    (New-Step 'GET' '/api/v2/workspaces/workspace-pyramid' (New-Workspace $replacement))
+))
+Assert-Throws {Invoke-CoderWorkspace -Mappings $defaultMappings -Alias 'PyramidKV-plugin' -Credential $credential -RequestHandler $transport.Handler -PollIntervalMilliseconds 1 -AllowUnreadyPort} 'changed|old build' 'pending allocated port must not escape revalidation' | Out-Null
+Assert-Transport $transport
+Pass 'new pending allocation preserves start-once behavior and rejects replacement-build ports'
+
+$withoutPort=New-Build -Status 'pending' -Id 'build-new' -Port 32123
+$withoutPort.resources=@()
+$transport=New-Transport (@(Get-Prefix (New-Workspace $withoutPort)) + @(
+    (New-Step 'GET' '/api/v2/workspacebuilds/build-new' $withoutPort),
+    (New-Step 'GET' '/api/v2/workspacebuilds/build-new' $newRunning),
+    (New-Step 'GET' '/api/v2/workspaces/workspace-pyramid' (New-Workspace $newRunning))
+))
+$result=Invoke-CoderWorkspace -Mappings $defaultMappings -Alias 'PyramidKV-plugin' -Credential $credential -RequestHandler $transport.Handler -PollIntervalMilliseconds 1 -AllowUnreadyPort
+Assert-Equal $result.Port 32098 'pending build without metadata waits for an observed port; no old-port fallback exists'
+Assert-Equal $result.Status 'running' 'completed pending build reports its actual final state'
+Assert-Transport $transport
+$transport=New-Transport (Get-Prefix (New-Workspace $allocated))
+$notReady=$false
+try { $null=Invoke-CoderWorkspace -Mappings $defaultMappings -Alias 'PyramidKV-plugin' -Credential $credential -RequestHandler $transport.Handler -RequireAlreadyRunning -AllowUnreadyPort }
+catch { $notReady=($_.Exception.Data['CoderNotRunning'] -eq $true) }
+Assert-True $notReady 'Check guard must return classified not-ready even if allocated-port handoff is requested.'
+Assert-Transport $transport
+Pass 'missing pending metadata is never invented and read-only checks never join or start an unready build'
+
 foreach ($status in @('failed', 'canceled')) {
     $failed = New-Build -Status $status
     $failed.job.error = 'fake-secret-password fake-session-token raw-response-body'

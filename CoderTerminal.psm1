@@ -1,5 +1,6 @@
 ﻿Set-StrictMode -Version 2.0
 $script:CoderRootModule = Import-Module (Join-Path $PSScriptRoot 'Coder.psm1') -PassThru -ErrorAction Stop
+Import-Module (Join-Path $PSScriptRoot 'HostKeys.psm1') -ErrorAction Stop
 
 function Stop-CoderRoot([string]$Message) {
     $errorObject = [InvalidOperationException]::new($Message)
@@ -53,13 +54,14 @@ function Get-RootSshPort($Build) {
     return Get-CoderSshPort -Build $Build
 }
 
-function Get-RootAgent($Build) {
+function Get-RootAgent($Build, [switch]$AllowMissing) {
     $agents = @()
     foreach ($resource in @(Get-RootField $Build 'resources' @())) {
         foreach ($agent in @(Get-RootField $resource 'agents' @())) {
             if ($null -ne $agent) { $agents += $agent }
         }
     }
+    if ($AllowMissing -and $agents.Count -eq 0) { return $null }
     if ($agents.Count -ne 1) { Stop-CoderRoot 'The selected workspace must have exactly one terminal agent; no command was submitted.' }
     $null = Get-RootId $agents[0]
     if ([string](Get-RootField $agents[0] 'operating_system') -cne 'linux') {
@@ -68,16 +70,18 @@ function Get-RootAgent($Build) {
     return $agents[0]
 }
 
-function Assert-RootWorkspaceSnapshot($ApiArguments, [string]$WorkspaceId, [string]$BuildId, [string]$WorkspaceName, [int]$Port) {
+function Assert-RootWorkspaceSnapshot($ApiArguments, [string]$WorkspaceId, [string]$BuildId, [string]$WorkspaceName, [int]$Port, [switch]$RequireRunning) {
     $workspace = Invoke-RootApi $ApiArguments GET ('/api/v2/workspaces/' + $WorkspaceId)
     $latest = Get-RootField $workspace 'latest_build'
     if ((Get-RootId $workspace) -cne $WorkspaceId -or
         -not [string]::Equals([string](Get-RootField $workspace 'name'), $WorkspaceName, [StringComparison]::OrdinalIgnoreCase) -or
-        (Get-RootId $latest) -cne $BuildId -or [string](Get-RootField $latest 'status') -cne 'running') {
+        (Get-RootId $latest) -cne $BuildId -or @('running','pending','starting') -cnotcontains [string](Get-RootField $latest 'status') -or
+        ($RequireRunning -and [string](Get-RootField $latest 'status') -cne 'running')) {
         Stop-CoderRoot 'The workspace changed during terminal preparation; the selected server could not be confirmed.'
     }
     $build = Invoke-RootApi $ApiArguments GET ('/api/v2/workspacebuilds/' + $BuildId)
-    if ((Get-RootId $build) -cne $BuildId -or [string](Get-RootField $build 'status') -cne 'running' -or
+    if ((Get-RootId $build) -cne $BuildId -or @('running','pending','starting') -cnotcontains [string](Get-RootField $build 'status') -or
+        ($RequireRunning -and [string](Get-RootField $build 'status') -cne 'running') -or
         (Get-RootSshPort $build) -ne $Port) {
         Stop-CoderRoot 'The running build or SSH port changed during terminal preparation.'
     }
@@ -88,7 +92,8 @@ function New-RootTerminalRequest([string]$AgentId, [string]$SessionToken, [int]$
     $nonce = [Guid]::NewGuid().ToString('N')
     # The complete proof prefix never appears literally in the submitted command,
     # so a PTY command echo cannot masquerade as command completion.
-    $body = 'chmod g-w /root; rc=$?; mode=$(stat -c %a /root 2>/dev/null); sr=$?; printf "\n%s%s|%s|%s|%s\n" "__SPM_" "' + $nonce + '__" "$rc" "$sr" "$mode"; exit "$rc"'
+    # Read only host PUBLIC keys. The private key paths are never opened.
+    $body = 'chmod g-w /root; rc=$?; mode=$(stat -c %a /root 2>/dev/null); sr=$?; for f in /etc/ssh/ssh_host_*_key.pub; do [ -f "$f" ] || continue; while read -r alg key rest; do printf "\n%s%s|%s|%s\n" "__SPK_" "' + $nonce + '__" "$alg" "$key"; done < "$f"; done; printf "\n%s%s|%s|%s|%s\n" "__SPM_" "' + $nonce + '__" "$rc" "$sr" "$mode"; exit "$rc"'
     $command = "sh -c '" + $body + "'"
     $uri = 'wss://coder.sage.org.ai:9450/api/v2/workspaceagents/' + $AgentId + '/pty?reconnect=' + [Guid]::NewGuid().ToString('D') + '&height=24&width=120&backend_type=buffered&command=' + [Uri]::EscapeDataString($command)
     return [pscustomobject]@{
@@ -112,7 +117,16 @@ function Read-RootTerminalProof([string]$Output, [string]$Nonce) {
     if ($statExitCode -ne 0) { Stop-CoderRoot 'chmod returned successfully, but /root permissions could not be verified.' }
     $numericMode = [Convert]::ToInt32($mode, 8)
     if (($numericMode -band 16) -ne 0) { Stop-CoderRoot 'The terminal still reports group-write permission on /root.' }
-    return [pscustomobject]@{ RootMode=$mode; ExitCode=0 }
+    $keyPattern = '(?m)^__SPK_' + $Nonce + '__\|([^|\r\n]+)\|([^|\r\n]+)\r?$'
+    $keyRecords = [regex]::Matches($Output, $keyPattern)
+    $keyLines = [regex]::Matches($Output, '(?m)^__SPK_' + $Nonce + '__[^\r\n]*\r?$')
+    if ($keyLines.Count -ne $keyRecords.Count -or @($keyRecords | Where-Object { $_.Index -gt $proofs[0].Index }).Count -gt 0) {
+        Stop-CoderRoot 'The terminal returned malformed SSH host public-key records; local trust was not updated.'
+    }
+    $keys = @($keyRecords | ForEach-Object { [pscustomobject]@{Algorithm=$_.Groups[1].Value;Key=$_.Groups[2].Value} })
+    try { $keys = @(ConvertTo-ValidatedHostKeys -Keys $keys) }
+    catch { Stop-CoderRoot 'The terminal did not provide valid SSH host public keys; local trust was not updated.' }
+    return [pscustomobject]@{ RootMode=$mode; ExitCode=0; HostKeys=$keys }
 }
 
 function Initialize-RootTerminalTransport {
@@ -208,7 +222,10 @@ function Invoke-CoderRootPreparation {
         [Parameter(Mandatory=$true)][ValidateRange(1,65535)][int]$Port,
         [Parameter(Mandatory=$true)][pscredential]$Credential,
         [string]$WorkspaceName,
-        [ValidateRange(1,600)][int]$TimeoutSeconds = 600,
+        [ValidateRange(1,600)][int]$TimeoutSeconds = 210,
+        [ValidateRange(0,180)][int]$WaitSeconds = 180,
+        [ValidateSet('Sync','Check')][string]$Mode = 'Sync',
+        [string]$DeadlineUtc,
         [scriptblock]$OnProgress = {},
         [scriptblock]$RequestHandler,
         [scriptblock]$TerminalHandler
@@ -219,7 +236,18 @@ function Invoke-CoderRootPreparation {
     $loginBody = $null
     $terminalRequest = $null
     $submitted = $false
+    $waitDeadline = [DateTimeOffset]::UtcNow.AddSeconds($WaitSeconds)
     try {
+        if ($DeadlineUtc) {
+            $parsedDeadline = [DateTimeOffset]::MinValue
+            if (-not [DateTimeOffset]::TryParse($DeadlineUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsedDeadline)) { Stop-CoderRoot 'Invalid readiness deadline.' }
+            # A shared absolute deadline is authoritative; rounded remaining seconds
+            # must not make the next stage finish early or restart a three-minute wait.
+            $waitDeadline=$parsedDeadline
+            $maximumDeadline=[DateTimeOffset]::UtcNow.AddSeconds(180)
+            if ($waitDeadline -gt $maximumDeadline) { $waitDeadline=$maximumDeadline }
+        }
+        if ($Mode -eq 'Check') { $waitDeadline = [DateTimeOffset]::UtcNow }
         if ($PSBoundParameters.ContainsKey('WorkspaceName') -and ([string]::IsNullOrWhiteSpace($WorkspaceName) -or $WorkspaceName.Length -gt 128 -or $WorkspaceName -match '[\r\n\x00]')) {
             Stop-CoderRoot 'Invalid expected Coder workspace name.'
         }
@@ -242,11 +270,11 @@ function Invoke-CoderRootPreparation {
         $candidates = @()
         foreach ($workspace in $all) {
             $latest = Get-RootField $workspace 'latest_build'
-            if ([string](Get-RootField $latest 'status') -cne 'running') { continue }
+            if (@('running','pending','starting') -cnotcontains [string](Get-RootField $latest 'status')) { continue }
             $workspaceId = Get-RootId $workspace
             $buildId = Get-RootId $latest
             $build = Invoke-RootApi $api GET ('/api/v2/workspacebuilds/' + $buildId)
-            if ((Get-RootId $build) -cne $buildId -or [string](Get-RootField $build 'status') -cne 'running') { continue }
+            if ((Get-RootId $build) -cne $buildId -or @('running','pending','starting') -cnotcontains [string](Get-RootField $build 'status')) { continue }
             $candidatePort = $null
             try { $candidatePort = Get-RootSshPort $build } catch {
                 if ($WorkspaceName) { Stop-CoderRoot 'The expected workspace has invalid or ambiguous SSH metadata; no command was submitted.' }
@@ -258,24 +286,40 @@ function Invoke-CoderRootPreparation {
                 $candidates += [pscustomobject]@{WorkspaceId=$workspaceId;BuildId=$buildId;Name=$name;Build=$build}
             }
         }
-        if ($candidates.Count -ne 1) { Stop-CoderRoot 'The SSH port must identify exactly one running Coder workspace; no command was submitted.' }
+        if ($candidates.Count -ne 1) { Stop-CoderRoot 'The SSH port must identify exactly one running or starting Coder workspace; no command was submitted.' }
         $selected = $candidates[0]
         $agentId = $null
         while ($true) {
             $null = Get-RootRemaining $clock $TimeoutSeconds
             $freshBuild = Assert-RootWorkspaceSnapshot $api $selected.WorkspaceId $selected.BuildId $selected.Name $Port
-            $agent = Get-RootAgent $freshBuild
-            $currentAgentId = Get-RootId $agent
-            if ($agentId -and $agentId -cne $currentAgentId) { Stop-CoderRoot 'The terminal agent changed; no command was submitted.' }
-            $agentId = $currentAgentId
-            $status = [string](Get-RootField $agent 'status')
-            $lifecycle = [string](Get-RootField $agent 'lifecycle_state')
-            if ($status -ceq 'connected' -and $lifecycle -ceq 'ready') { break }
-            if (@('start_error','start_timeout','shutdown_timeout','shutdown_error','off') -ccontains $lifecycle) {
-                Stop-CoderRoot 'The terminal agent is not ready; no command was submitted.'
+            $buildRunning=([string](Get-RootField $freshBuild 'status') -ceq 'running')
+            $agentReady=$false
+            $agent = Get-RootAgent $freshBuild -AllowMissing:(-not $buildRunning)
+            if ($null -ne $agent) {
+                $currentAgentId = Get-RootId $agent
+                if ($agentId -and $agentId -cne $currentAgentId) { Stop-CoderRoot 'The terminal agent changed; no command was submitted.' }
+                $agentId = $currentAgentId
+                $status = [string](Get-RootField $agent 'status')
+                $lifecycle = [string](Get-RootField $agent 'lifecycle_state')
+                $agentReady=($buildRunning -and $status -ceq 'connected' -and $lifecycle -ceq 'ready')
+                if (@('connecting','connected','disconnected','timeout') -cnotcontains $status -or
+                    @('created','starting','ready') -cnotcontains $lifecycle) {
+                    Stop-CoderRoot 'The terminal agent readiness could not be confirmed; no command was submitted.'
+                }
+            }
+            # Only a Check action may accept readiness after the waiting budget.
+            # The network grace period verifies the endpoint; it cannot extend
+            # the user's three-minute allowance for deciding to submit chmod.
+            if ($agentReady -and ($Mode -eq 'Check' -or [DateTimeOffset]::UtcNow -lt $waitDeadline)) { break }
+            if ([DateTimeOffset]::UtcNow -ge $waitDeadline) {
+                $resultName = if ($WorkspaceName) { $WorkspaceName } else { $selected.Name }
+                $outcome = if ($Mode -eq 'Check') { 'NotReady' } else { 'Deferred' }
+                & $OnProgress 'Terminal is not ready; chmod and new host keys are deferred. No command was submitted.' | Out-Null
+                return [pscustomobject]@{WorkspaceName=$resultName;Port=$Port;Command='chmod g-w /root';RootMode='';ExitCode=$null;Outcome=$outcome;Ready=$false;CommandExecuted=$false;HostKeys=@()}
             }
             & $OnProgress 'Waiting for the Coder terminal agent to become ready...' | Out-Null
-            Start-Sleep -Milliseconds ([Math]::Min(1000, (Get-RootRemaining $clock $TimeoutSeconds)))
+            $waitMilliseconds=[Math]::Max(1,[Math]::Ceiling(($waitDeadline-[DateTimeOffset]::UtcNow).TotalMilliseconds))
+            Start-Sleep -Milliseconds ([Math]::Min(1000, [Math]::Min($waitMilliseconds,(Get-RootRemaining $clock $TimeoutSeconds))))
         }
         & $OnProgress 'Running chmod g-w /root in the Coder terminal...' | Out-Null
         $terminalRequest = New-RootTerminalRequest $agentId $session (Get-RootRemaining $clock $TimeoutSeconds)
@@ -285,11 +329,11 @@ function Invoke-CoderRootPreparation {
         $null = Get-RootRemaining $clock $TimeoutSeconds
         if ($output -isnot [string]) { Stop-CoderRoot 'The terminal did not return a valid completion record.' }
         $proof = Read-RootTerminalProof $output $terminalRequest.Nonce
-        $after = Assert-RootWorkspaceSnapshot $api $selected.WorkspaceId $selected.BuildId $selected.Name $Port
+        $after = Assert-RootWorkspaceSnapshot $api $selected.WorkspaceId $selected.BuildId $selected.Name $Port -RequireRunning
         if ((Get-RootId (Get-RootAgent $after)) -cne $agentId) { Stop-CoderRoot 'The terminal agent changed after chmod; the selected endpoint could not be confirmed.' }
         & $OnProgress ('chmod g-w /root completed; /root mode is ' + $proof.RootMode + '.') | Out-Null
         $resultName = if ($WorkspaceName) { $WorkspaceName } else { $selected.Name }
-        return [pscustomobject]@{WorkspaceName=$resultName;Port=$Port;Command='chmod g-w /root';RootMode=$proof.RootMode;ExitCode=0}
+        return [pscustomobject]@{WorkspaceName=$resultName;Port=$Port;Command='chmod g-w /root';RootMode=$proof.RootMode;ExitCode=0;Outcome='Prepared';Ready=$true;CommandExecuted=$true;HostKeys=@($proof.HostKeys)}
     } catch {
         if ($_.Exception -is [TimeoutException] -or $_.Exception.Data['CoderRootTimeout'] -eq $true -or $clock.Elapsed.TotalMilliseconds -ge ([double]$TimeoutSeconds * 1000)) {
             if ($submitted) { Stop-CoderRoot 'Coder root preparation timed out after command submission; chmod may already have run. Check the workspace before retrying.' }

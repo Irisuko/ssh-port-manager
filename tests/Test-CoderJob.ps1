@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $project = Split-Path -Parent $PSScriptRoot
 Import-Module (Join-Path $project 'CredentialStore.psm1') -Force
 Import-Module (Join-Path $project 'CoderJob.psm1') -Force
@@ -89,6 +89,42 @@ try {
     Assert (-not $result.Success -and $result.Error -match 'failed in fixture') 'Failure must be surfaced.'
     Assert ([IO.File]::ReadAllText($configPath) -ceq $source) 'Failures must leave config intact.'
     Pass 'network failures report error and leave configuration intact'
+
+    $argumentsSeen=@{}
+    $observed={
+        param($Alias,$Credential,$OnProgress,$TimeoutSeconds,$RequireAlreadyRunning,$AllowUnreadyPort)
+        $argumentsSeen.Timeout=$TimeoutSeconds;$argumentsSeen.Check=$RequireAlreadyRunning;$argumentsSeen.Pending=$AllowUnreadyPort
+        [pscustomobject]@{WorkspaceName='PyramidKV';Port=32091;Started=$false;Status='running'}
+    }.GetNewClosure()
+    $request | Add-Member -NotePropertyName Mode -NotePropertyValue 'Check'
+    $result=Invoke-CoderJob -Request $request -Credential $credential -StartWorkspace $observed
+    Assert ($result.Success -and $argumentsSeen.Check -eq $true -and -not $argumentsSeen.Pending -and $argumentsSeen.Timeout -eq 30) 'Check must be read-only and use a short network budget.'
+    $result=Invoke-CoderJob -Request $request -Credential $credential -StartWorkspace $fakeStart
+    Assert (-not $result.Success) 'A Check result claiming it started a server must never be accepted.'
+    $unready={ $errorObject=[InvalidOperationException]::new('fixture not running');$errorObject.Data['CoderNotRunning']=$true;throw $errorObject }
+    $result=Invoke-CoderJob -Request $request -Credential $credential -StartWorkspace $unready
+    Assert (-not $result.Success -and $result.NotReady -and $null -eq $result.Port) 'Known non-running check must expose NotReady without a stale port.'
+    Pass 'check never starts, uses bounded inspection and distinguishes a verified non-running workspace'
+
+    $request.Mode='Auto'
+    $request | Add-Member -NotePropertyName DeadlineUtc -NotePropertyValue ([DateTimeOffset]::UtcNow.AddSeconds(45).ToString('o'))
+    $result=Invoke-CoderJob -Request $request -Credential $credential -StartWorkspace $observed
+    Assert ($result.Success -and $argumentsSeen.Pending -eq $true -and -not $argumentsSeen.Check -and $argumentsSeen.Timeout -gt 0 -and $argumentsSeen.Timeout -le 45) 'Auto requests observed pending allocation with the remaining shared deadline.'
+    $request.DeadlineUtc=[DateTimeOffset]::UtcNow.AddSeconds(-1).ToString('o')
+    $result=Invoke-CoderJob -Request $request -Credential $credential -StartWorkspace $noCall
+    Assert (-not $result.Success -and $result.Error -notmatch 'MUST NOT') 'Expired startup deadline must reject before network with no old-port fallback.'
+    $request.PSObject.Properties.Remove('DeadlineUtc')
+    $allocated={ [pscustomobject]@{WorkspaceName='PyramidKV';Port=32123;Started=$true;Status='pending';Deferred=$true} }
+    $result=Invoke-CoderJob -Request $request -Credential $credential -StartWorkspace $allocated
+    Assert ($result.Success -and $result.Deferred -and $result.Status -ceq 'pending' -and $result.Port -eq 32123) 'Auto may hand off explicitly unready current allocation for bounded preparation.'
+    $noEvidence={ [pscustomobject]@{WorkspaceName='PyramidKV';Port=32123;Started=$false;Status='pending'} }
+    $result=Invoke-CoderJob -Request $request -Credential $credential -StartWorkspace $noEvidence
+    Assert (-not $result.Success) 'Unready port without explicit deferred evidence must be rejected.'
+    $request.Mode='Check'
+    $result=Invoke-CoderJob -Request $request -Credential $credential -StartWorkspace $noEvidence
+    Assert (-not $result.Success -and $null -eq $result.Port) 'Check must never accept a pending allocation.'
+    Assert ([IO.File]::ReadAllText($configPath) -ceq $source) 'Readiness handling must never mutate local configuration.'
+    Pass 'shared startup budget and explicit current pending allocation preserve truthful state and local isolation'
     Write-Output ('Coder job tests passed: ' + $script:passed)
 } finally {
     $PSDefaultParameterValues.Remove('Invoke-CoderJob:Mappings')

@@ -5,6 +5,8 @@ Import-Module (Join-Path $project 'SshConfig.psm1') -Force -DisableNameChecking
 $testRoot = Join-Path $PSScriptRoot ('.runs\preparation-job-' + [guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($testRoot)
 $script:passed = 0
+$hostKey=[Convert]::ToBase64String([byte[]](0,0,0,11)+[Text.Encoding]::ASCII.GetBytes('ssh-ed25519')+[byte[]](0,0,0,32)+(New-Object byte[] 32))
+$hostKeys=@([pscustomobject]@{Algorithm='ssh-ed25519';Key=$hostKey})
 function Assert($Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
 function Pass([string]$Message) { $script:passed++; Write-Output ('PASS: ' + $Message) }
 try {
@@ -22,11 +24,12 @@ try {
         param($Port,$Credential,$WorkspaceName,$OnProgress)
         $calls.Add([pscustomobject]@{Port=$Port;WorkspaceName=$WorkspaceName})
         & $OnProgress 'fixture progress'
-        [pscustomobject]@{WorkspaceName=$(if ($WorkspaceName) {$WorkspaceName} else {'Discovered'});Port=$Port;Command='chmod g-w /root';RootMode='0755';ExitCode=0}
+        [pscustomobject]@{WorkspaceName=$(if ($WorkspaceName) {$WorkspaceName} else {'Discovered'});Port=$Port;Command='chmod g-w /root';RootMode='0755';ExitCode=0;Outcome='Prepared';Ready=$true;CommandExecuted=$true;HostKeys=$hostKeys}
     }.GetNewClosure()
     $onProgress = {param($Message) $progress.Add($Message)}.GetNewClosure()
     $result = Invoke-PreparationJob -Request $request -Credential $credential -PrepareWorkspace $prepare -OnProgress $onProgress
     Assert $result.Success 'A valid preparation should succeed.'
+    Assert ($result.CanApply -and $result.Ready -and -not $result.Deferred -and $result.Results[0].HostKeys[0].Key -ceq $hostKey) 'Successful preparation must explicitly permit apply and return verified host keys.'
     Assert ($calls.Count -eq 1 -and $calls[0].WorkspaceName -ceq 'PyramidKV') 'Blank hosts must be skipped and automatic workspace frozen.'
     Assert ($result.Updates.Count -eq 1 -and $result.Updates[0].Id -ceq $id1 -and $result.Updates[0].Port -eq 32091) 'Returned updates must preserve selected Id and normalized port.'
     Assert ($result.Results.Count -eq 1 -and $result.Results[0].Success -and $result.Results[0].Command -ceq 'chmod g-w /root') 'Return explicit command success for selected host.'
@@ -68,11 +71,11 @@ try {
     $request.ExpectedHash = $doc.Hash
     Pass 'stale config rejected before remote effects'
 
-    foreach ($case in @('Port','Workspace','Command','Mode','Exit','Missing')) {
+    foreach ($case in @('Port','Workspace','Command','Mode','Exit','Missing','Keys','NoKeys','NotReady','NoCommand')) {
         $request.Updates = @([pscustomobject]@{Id=$id1;Port=32091;WorkspaceName='PyramidKV'})
         $badResult = {
             param($Port,$Credential,$WorkspaceName,$OnProgress)
-            $remote = [pscustomobject]@{WorkspaceName='PyramidKV';Port=32091;Command='chmod g-w /root';RootMode='755';ExitCode=0}
+            $remote = [pscustomobject]@{WorkspaceName='PyramidKV';Port=32091;Command='chmod g-w /root';RootMode='755';ExitCode=0;Outcome='Prepared';Ready=$true;CommandExecuted=$true;HostKeys=$hostKeys}
             switch ($case) {
                 'Port' {$remote.Port=32092}
                 'Workspace' {$remote.WorkspaceName='Other'}
@@ -80,11 +83,15 @@ try {
                 'Mode' {$remote.RootMode='775'}
                 'Exit' {$remote.ExitCode=1}
                 'Missing' {$remote.PSObject.Properties.Remove('ExitCode')}
+                'Keys' {$remote.HostKeys=@([pscustomobject]@{Algorithm='ssh-ed25519';Key='invalid'})}
+                'NoKeys' {$remote.HostKeys=@()}
+                'NotReady' {$remote.Ready=$false}
+                'NoCommand' {$remote.CommandExecuted=$false}
             }
             return $remote
         }.GetNewClosure()
         $result = Invoke-PreparationJob -Request $request -Credential $credential -PrepareWorkspace $badResult
-        Assert (-not $result.Success -and $result.Results.Count -eq 1 -and -not $result.Results[0].Success) ('Reject unverified terminal result: ' + $case)
+        Assert (-not $result.Success -and -not $result.CanApply -and $result.Results.Count -eq 1 -and -not $result.Results[0].Success) ('Reject unverified terminal result: ' + $case)
     }
     Pass 'wrong target, command, writable mode and missing or nonzero exit cannot report success'
 
@@ -94,7 +101,7 @@ try {
         param($Port,$Credential,$WorkspaceName,$OnProgress)
         $callState.Count++
         if ($callState.Count -eq 2) { throw 'Fixture terminal unavailable.' }
-        [pscustomobject]@{WorkspaceName='First';Port=$Port;Command='chmod g-w /root';RootMode='700';ExitCode=0}
+        [pscustomobject]@{WorkspaceName='First';Port=$Port;Command='chmod g-w /root';RootMode='700';ExitCode=0;Outcome='Prepared';Ready=$true;CommandExecuted=$true;HostKeys=$hostKeys}
     }.GetNewClosure()
     $result = Invoke-PreparationJob -Request $request -Credential $credential -PrepareWorkspace $partial
     Assert (-not $result.Success -and $result.Results.Count -eq 2 -and $result.Results[0].Success -and -not $result.Results[1].Success) 'Preserve completed remote result when next server fails.'
@@ -111,12 +118,67 @@ try {
     Assert (-not $result.Success -and $callState.Count -eq 1 -and $result.Results.Count -eq 1) 'First failure must stop remote commands for all later hosts.'
     Pass 'first remote failure stops later hosts without pretending they ran'
 
+    $request.Updates=@([pscustomobject]@{Id=$id1;Port=32091;WorkspaceName='PyramidKV'})
+    $request | Add-Member -NotePropertyName Mode -NotePropertyValue 'Sync'
+    $request | Add-Member -NotePropertyName WaitSeconds -NotePropertyValue 0
+    $budgets=[Collections.Generic.List[object]]::new()
+    $defer={
+        param($Port,$Credential,$WorkspaceName,$OnProgress,$Mode,$WaitSeconds,$DeadlineUtc,$TimeoutSeconds)
+        $budgets.Add([pscustomobject]@{Mode=$Mode;Wait=$WaitSeconds;Deadline=$DeadlineUtc;Timeout=$TimeoutSeconds})
+        [pscustomobject]@{WorkspaceName=$WorkspaceName;Port=$Port;Command='chmod g-w /root';RootMode='';ExitCode=$null;Outcome=$(if($Mode -eq 'Check'){'NotReady'}else{'Deferred'});Ready=$false;CommandExecuted=$false;HostKeys=@()}
+    }.GetNewClosure()
+    $result=Invoke-PreparationJob -Request $request -Credential $credential -PrepareWorkspace $defer
+    Assert ($result.Success -and $result.CanApply -and $result.Deferred -and -not $result.Ready -and $result.Results[0].Outcome -ceq 'Deferred' -and -not $result.Results[0].CommandExecuted -and $result.Results[0].HostKeys.Count -eq 0) 'Verified unready server after deadline may hand off local-only update without command or keys.'
+    Assert ($budgets[0].Wait -eq 0 -and $budgets[0].Timeout -eq 30 -and [IO.File]::ReadAllText($config) -ceq $original) 'Readiness timeout retains only a short verification budget and never writes local files.'
+    $request.Mode='Check';$request.WaitSeconds=180
+    $result=Invoke-PreparationJob -Request $request -Credential $credential -PrepareWorkspace $defer
+    Assert (-not $result.Success -and -not $result.CanApply -and -not $result.Deferred -and $result.Results[0].Outcome -ceq 'NotReady' -and $budgets[1].Wait -eq 0) 'Check uses no readiness wait and cannot apply when server is unready.'
+    $result=Invoke-PreparationJob -Request $request -Credential $credential -PrepareWorkspace $prepare
+    Assert ($result.Success -and $result.CanApply -and $result.Ready) 'Ready check still verifies command and host keys.'
+    Pass 'deferred sync allows local handoff while immediate unready checks block every local mutation'
+
+    $request.Mode='Sync';$request.WaitSeconds=0
+    foreach($case in @('Command','Keys','Mode','Outcome')) {
+        $contradictory={
+            param($Port,$Credential,$WorkspaceName)
+            $remote=[pscustomobject]@{WorkspaceName=$WorkspaceName;Port=$Port;Command='chmod g-w /root';RootMode='';ExitCode=$null;Outcome='Deferred';Ready=$false;CommandExecuted=$false;HostKeys=@()}
+            switch($case){'Command'{$remote.CommandExecuted=$true};'Keys'{$remote.HostKeys=$hostKeys};'Mode'{$remote.RootMode='755'};'Outcome'{$remote.Outcome='NotReady'}}
+            $remote
+        }.GetNewClosure()
+        $result=Invoke-PreparationJob -Request $request -Credential $credential -PrepareWorkspace $contradictory
+        Assert (-not $result.Success -and -not $result.CanApply) ('Contradictory deferred result must not authorize local updates: '+$case)
+    }
+    $request.WaitSeconds=180
+    $result=Invoke-PreparationJob -Request $request -Credential $credential -PrepareWorkspace $defer
+    Assert (-not $result.Success -and -not $result.CanApply) 'Deferred results cannot bypass the allowed readiness wait.'
+    Pass 'contradictory and early deferred results cannot authorize local updates'
+
+    $request.WaitSeconds=0
+    $sharedDeadline=[DateTimeOffset]::UtcNow.AddSeconds(45).ToString('o')
+    $request | Add-Member -NotePropertyName DeadlineUtc -NotePropertyValue $sharedDeadline
+    $request.Updates=@([pscustomobject]@{Id=$id1;Port=32091},[pscustomobject]@{Id=$id2;Port=32092})
+    $budgetPrepare={
+        param($Port,$Credential,$WorkspaceName,$OnProgress,$Mode,$WaitSeconds,$DeadlineUtc,$TimeoutSeconds)
+        $budgets.Add([pscustomobject]@{Mode=$Mode;Wait=$WaitSeconds;Deadline=$DeadlineUtc;Timeout=$TimeoutSeconds})
+        [pscustomobject]@{WorkspaceName='Discovered';Port=$Port;Command='chmod g-w /root';RootMode='755';ExitCode=0;Outcome='Prepared';Ready=$true;CommandExecuted=$true;HostKeys=$hostKeys}
+    }.GetNewClosure()
+    $budgets.Clear()
+    $result=Invoke-PreparationJob -Request $request -Credential $credential -PrepareWorkspace $budgetPrepare
+    Assert ($result.Success -and $budgets.Count -eq 2 -and $budgets[0].Deadline -ceq $sharedDeadline -and $budgets[1].Deadline -ceq $sharedDeadline -and $budgets[0].Wait -gt 0 -and $budgets[0].Wait -le 45 -and $budgets[1].Wait -le $budgets[0].Wait) 'All rows must preserve the same absolute deadline instead of restarting or truncating it from rounded seconds.'
+    foreach($bad in @('bogus',181,-1)) {
+        $request.WaitSeconds=$bad
+        $result=Invoke-PreparationJob -Request $request -Credential $credential -PrepareWorkspace {throw 'NETWORK MUST NOT RUN'}
+        Assert (-not $result.Success -and $result.Results.Count -eq 0 -and $result.Error -notmatch 'NETWORK MUST NOT RUN') 'Invalid wait values must fail before remote effects.'
+    }
+    $request.PSObject.Properties.Remove('DeadlineUtc');$request.PSObject.Properties.Remove('WaitSeconds');$request.PSObject.Properties.Remove('Mode')
+    Pass 'shared absolute deadline survives rounded input and remains bounded across multiple hosts'
+
     $callState.Count=0
     $externalEdit = {
         param($Port,$Credential,$WorkspaceName,$OnProgress)
         $callState.Count++
         [IO.File]::AppendAllText($config, '# external fixture edit')
-        [pscustomobject]@{WorkspaceName='First';Port=$Port;Command='chmod g-w /root';RootMode='755';ExitCode=0}
+        [pscustomobject]@{WorkspaceName='First';Port=$Port;Command='chmod g-w /root';RootMode='755';ExitCode=0;Outcome='Prepared';Ready=$true;CommandExecuted=$true;HostKeys=$hostKeys}
     }.GetNewClosure()
     $result = Invoke-PreparationJob -Request $request -Credential $credential -PrepareWorkspace $externalEdit
     Assert (-not $result.Success -and $callState.Count -eq 1 -and $result.Results[0].Success) 'Config change after first remote command must prevent later commands and local handoff.'

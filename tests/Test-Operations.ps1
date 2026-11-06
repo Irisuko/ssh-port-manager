@@ -163,6 +163,89 @@ try {
     Assert-True (-not [string]::IsNullOrWhiteSpace($r.Error)) 'partial failure carries an error'
     Pass 'ssh-keygen failure reports partial completion and backups'
 
+    $parts=$publicKey -split ' '
+    $trusted=@([pscustomobject]@{Algorithm=$parts[0];Key=$parts[1]})
+    $f=New-Fixture 'install-trusted-key' $knownText
+    $r=Invoke-PortChanges -Request (New-Request $f @(@{Id=$f.Targets[0].Id;Port='32091';AddHostKeys=$true;HostKeys=$trusted}))
+    Assert-True $r.Success ('trusted key install succeeds: '+$r.Error)
+    Assert-True $r.Results[0].KeyAdded 'successful key addition is explicit'
+    Assert-Equal $r.Results[0].AddedKeys 1 'exactly one trusted key added'
+    Assert-True (-not $r.Results[0].KeyPending) 'installed keys are not pending'
+    Assert-Equal @([IO.File]::ReadAllLines($f.Known) | Where-Object { $_ -eq "[36.140.239.91]:32091 $publicKey" }).Count 1 'new endpoint public key installed once'
+    Assert-True ([IO.File]::ReadAllText($f.Known).Contains('[192.0.2.20]:2222')) 'unrelated endpoint retained after addition'
+    $found=@(& $keygen -F '[36.140.239.91]:32091' -f $f.Known)
+    Assert-Equal $LASTEXITCODE 0 'real OpenSSH recognizes installed host key'
+    Assert-True (($found -join "`n").Contains($publicKey)) 'OpenSSH finds exact trusted key'
+    $again=Read-SshDocument -Path $f.Config
+    $request=New-Request $f @(@{Id=$f.Targets[0].Id;Port='32091';AddHostKeys=$true;HostKeys=$trusted})
+    $request.ExpectedHash=$again.Hash
+    $r=Invoke-PortChanges -Request $request
+    Assert-True $r.Success 'repeated install succeeds'
+    Assert-Equal @([IO.File]::ReadAllLines($f.Known) | Where-Object { $_ -eq "[36.140.239.91]:32091 $publicKey" }).Count 1 'repeated cleanup and add does not duplicate host key'
+    Pass 'trusted new host keys install after cleanup, preserve unrelated entries and work in real OpenSSH'
+
+    $defaultKnownText="36.140.239.91 $publicKey`n[36.140.239.91]:22 $publicKey`n[36.140.239.91]:32091 $publicKey`n[192.0.2.20]:2222 $publicKey`n"
+    foreach ($hashDefaultKeys in @($false,$true)) {
+        $f=New-Fixture ('default-port-'+$hashDefaultKeys) $defaultKnownText
+        if ($hashDefaultKeys) {
+            $ErrorActionPreference='Continue'
+            & $keygen -H -f $f.Known 2>$null | Out-Null
+            $hashExitCode=$LASTEXITCODE
+            $ErrorActionPreference='Stop'
+            Assert-Equal $hashExitCode 0 'hash default-port fixture entries'
+        }
+        $beforeKnown=[IO.File]::ReadAllText($f.Known)
+        $r=Invoke-PortChanges -Request (New-Request $f @(@{Id=$f.Targets[0].Id;Port='22';AddHostKeys=$true;HostKeys=$trusted}))
+        Assert-True ($r.Success -and $r.Results[0].KeyAdded -and -not $r.Results[0].KeyPending) 'default port installs verified keys successfully'
+        Assert-Equal $r.Results[0].Endpoint '[36.140.239.91]:22' 'default port keeps stable UI result endpoint'
+        Assert-Equal ([IO.File]::ReadAllText($r.KnownHostsBackupPath)) $beforeKnown 'default port backs up both original key forms before cleanup'
+        Assert-Equal @([IO.File]::ReadAllLines($f.Known)).Count 3 'both old default-port forms are replaced by one canonical entry'
+        Assert-Equal @([IO.File]::ReadAllLines($f.Known) | Where-Object { $_ -ceq "36.140.239.91 $publicKey" }).Count 1 'default port installs canonical bare-host entry exactly once'
+        $found=@(& $keygen -F '36.140.239.91' -f $f.Known)
+        Assert-Equal $LASTEXITCODE 0 'real OpenSSH recognizes canonical default-port key'
+        Assert-True (($found -join "`n").Contains($publicKey)) 'canonical OpenSSH lookup finds verified public key'
+        $null=& $keygen -F '[36.140.239.91]:22' -f $f.Known
+        Assert-Equal $LASTEXITCODE 1 'obsolete bracketed default-port key is removed'
+        $null=& $keygen -F '[36.140.239.91]:32091' -f $f.Known
+        Assert-Equal $LASTEXITCODE 0 'nondefault key on the same IP is preserved'
+    }
+    Pass 'default port rotates plain and hashed host keys into the canonical OpenSSH bare-host name'
+
+    $f=New-Fixture 'default-port-deferred' $defaultKnownText
+    $r=Invoke-PortChanges -Request (New-Request $f @(@{Id=$f.Targets[0].Id;Port='22';AddHostKeys=$false;HostKeys=@()}))
+    Assert-True ($r.Success -and $r.Results[0].KeyPending -and -not $r.Results[0].KeyAdded) 'default-port deferred cleanup stays explicitly pending'
+    Assert-Equal ([IO.File]::ReadAllLines($f.Known) -join "`n") ("[36.140.239.91]:32091 $publicKey`n[192.0.2.20]:2222 $publicKey") 'default-port deferred cleanup removes both old forms without installing keys'
+    Pass 'default-port deferred cleanup removes bare and bracketed keys while preserving other ports'
+
+    $f=New-Fixture 'default-port-cleanup-failure' ("bad invalid line`n"+$defaultKnownText)
+    $beforeKnown=[IO.File]::ReadAllText($f.Known)
+    $r=Invoke-PortChanges -Request (New-Request $f @(@{Id=$f.Targets[0].Id;Port='22';AddHostKeys=$true;HostKeys=$trusted}))
+    Assert-True (-not $r.Success -and -not $r.Results[0].KeyAdded -and $r.Results[0].AddedKeys -eq 0) 'failed default-port cleanup cannot report new keys installed'
+    Assert-True $r.ConfigChanged 'default-port failure accurately reports config already changed'
+    Assert-Equal ([IO.File]::ReadAllText($f.Known)) $beforeKnown 'malformed known_hosts never receives new keys after cleanup fails'
+    Assert-Equal ([IO.File]::ReadAllText($r.KnownHostsBackupPath)) $beforeKnown 'default-port cleanup failure retains original backup'
+    Pass 'default-port cleanup failures block new-key installation and preserve recovery backup'
+
+    $f=New-Fixture 'create-known-hosts'
+    $r=Invoke-PortChanges -Request (New-Request $f @(@{Id=$f.Targets[0].Id;Port='32091';AddHostKeys=$true;HostKeys=$trusted}))
+    Assert-True ($r.Success -and $r.Results[0].KeyAdded) 'key addition creates absent known_hosts'
+    Assert-Equal ([IO.File]::ReadAllText($f.Known).Trim()) "[36.140.239.91]:32091 $publicKey" 'new known_hosts content exact'
+    Pass 'missing known_hosts is created only when verified keys are supplied'
+
+    $f=New-Fixture 'deferred-key-addition' $knownText
+    $r=Invoke-PortChanges -Request (New-Request $f @(@{Id=$f.Targets[0].Id;Port='32091';AddHostKeys=$false;HostKeys=@()}))
+    Assert-True ($r.Success -and $r.Results[0].KeyPending -and -not $r.Results[0].KeyAdded) 'deferred mode updates config and clears old key while explicitly pending new key'
+    Assert-True (-not ([IO.File]::ReadAllText($f.Known).Contains('[36.140.239.91]:32091'))) 'deferred mode does not invent host keys'
+    Pass 'not-ready sync completes local update and cleanup with key addition marked pending'
+
+    foreach ($bad in @(@{Id='1';Port='32091';AddHostKeys=$true;HostKeys=@()},@{Id='1';Port='32091';AddHostKeys=$true;HostKeys=@([pscustomobject]@{Algorithm='ssh-ed25519';Key="bad`n[evil]:22"})},@{Id='1';Port='32091';AddHostKeys='true';HostKeys=$trusted},@{Id='1';Port='32091';AddHostKeys=$false;HostKeys=$trusted})) {
+        $f=New-Fixture ('invalid-hostkey-'+[guid]::NewGuid().ToString('N')) $knownText
+        $r=Invoke-PortChanges -Request (New-Request $f @($bad))
+        Assert-True (-not $r.Success) 'invalid host key requests must fail'
+        Assert-Untouched $f $knownText
+    }
+    Pass 'missing, malformed, injected or contradictory host keys fail before any local mutation'
+
     Write-Output ('Operations tests passed: ' + $script:passed)
 }
 finally {

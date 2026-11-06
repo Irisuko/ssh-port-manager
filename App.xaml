@@ -74,7 +74,7 @@
               </Grid>
               <Button x:Name="StartSyncButton" Grid.Column="1" Content="启动并同步端口" Background="#2864DC" BorderBrush="#2864DC" Foreground="White" FontWeight="SemiBold" IsEnabled="False"/>
             </Grid>
-            <TextBlock x:Name="AutoHintText" Text="获取端口后先在 Terminal 执行 chmod g-w /root，成功后再同步本机配置。" Foreground="#61748D" FontSize="11" Margin="0,9,0,0" TextWrapping="Wrap"/>
+            <TextBlock x:Name="AutoHintText" Text="最多等待 3 分钟；未就绪时先同步已取得的端口并清理旧密钥。" Foreground="#61748D" FontSize="11" Margin="0,9,0,0" TextWrapping="Wrap"/>
             <TextBlock x:Name="CredentialStatusText" Text="正在读取登录凭据…" Foreground="#526780" FontSize="12" Margin="0,13,0,0" TextWrapping="Wrap"/>
             <Expander x:Name="LoginSettingsExpander" Header="登录设置" IsExpanded="False" Margin="0,10,0,0" Foreground="#455D78">
               <StackPanel Margin="0,12,0,0">
@@ -96,8 +96,22 @@
             </Expander>
           </StackPanel>
         </Border>
+        <Border Background="White" BorderBrush="#D6E2F5" BorderThickness="1" CornerRadius="12" Padding="20,17" Margin="0,0,0,20">
+          <StackPanel>
+            <TextBlock Text="检查服务器并连接" FontSize="18" FontWeight="SemiBold"/>
+            <TextBlock Text="只检查是否就绪，不启动服务器。就绪后执行 chmod、刷新主机密钥，再打开 VS Code Remote SSH。" Foreground="#61748D" Margin="0,7,0,12" TextWrapping="Wrap"/>
+            <Grid>
+              <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <Grid Margin="0,0,12,0">
+                <ComboBox x:Name="CheckHostComboBox" DisplayMemberPath="DisplayName" MinHeight="43" Padding="10,7" VerticalContentAlignment="Center" AutomationProperties.Name="检查并连接的 SSH 主机"/>
+                <TextBlock x:Name="CheckSelectionPlaceholder" Text="请选择要检查的 SSH 主机" Foreground="#728198" Margin="13,0,30,0" VerticalAlignment="Center" IsHitTestVisible="False"/>
+              </Grid>
+              <Button x:Name="CheckConnectButton" Grid.Column="1" Content="检查并连接 VS Code" Background="#2864DC" BorderBrush="#2864DC" Foreground="White" FontWeight="SemiBold" IsEnabled="False"/>
+            </Grid>
+          </StackPanel>
+        </Border>
         <TextBlock Text="手动更新端口" FontSize="18" FontWeight="SemiBold" Margin="1,0,0,6"/>
-        <TextBlock Text="按输入端口查找已运行的 Coder 工作区，执行 chmod g-w /root；需要保存 Coder 登录信息。" Foreground="#61748D" FontSize="11" Margin="2,0,0,12" TextWrapping="Wrap"/>
+        <TextBlock Text="按输入端口检查工作区，最多等待 3 分钟；就绪时执行 chmod 并添加新主机密钥。需要 Coder 登录信息。" Foreground="#61748D" FontSize="11" Margin="2,0,0,12" TextWrapping="Wrap"/>
         <DockPanel Margin="1,1,1,12">
           <TextBlock x:Name="HostCountText" Text="目标主机" FontSize="16" FontWeight="SemiBold" DockPanel.Dock="Left"/>
           <TextBlock Text="留空即跳过 · 端口范围 1–65535" Foreground="#61748D" HorizontalAlignment="Right" VerticalAlignment="Center"/>
@@ -109,7 +123,7 @@
             <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
             <StackPanel Margin="0,0,15,0">
               <TextBlock x:Name="SelectionText" Text="填写端口后，在这里预览操作" FontWeight="SemiBold" Foreground="#304F79"/>
-              <TextBlock x:Name="PreviewText" Text="确认后先执行 chmod g-w /root，成功后备份并更新 config、清除对应记录。" Margin="0,7,0,0" Foreground="#566D8C" FontSize="12" TextWrapping="Wrap"/>
+              <TextBlock x:Name="PreviewText" Text="就绪时执行 chmod 并刷新密钥；等待超时先同步端口和清理旧密钥，稍后可检查并连接。" Margin="0,7,0,0" Foreground="#566D8C" FontSize="12" TextWrapping="Wrap"/>
             </StackPanel>
             <Button x:Name="ApplyButton" Grid.Column="1" Content="确认手动更新" Background="#2864DC" BorderBrush="#2864DC" Foreground="White" FontSize="13" FontWeight="SemiBold" Padding="22,12" IsEnabled="False" VerticalAlignment="Center"/>
           </Grid>
@@ -121,7 +135,7 @@
     <Grid Grid.Row="2" Margin="0,20,0,0">
       <StackPanel VerticalAlignment="Center" Margin="0,0,15,0">
         <TextBlock x:Name="StatusText" Text="正在读取配置…" Foreground="#526780" TextWrapping="Wrap"/>
-        <TextBlock Text="远端权限命令成功后，备份并同步 config，再使用管理员 PowerShell 清理旧主机密钥记录。" FontSize="11" Foreground="#7C8BA0" Margin="0,5,0,0" TextWrapping="Wrap"/>
+        <TextBlock Text="本地更新会先备份。服务器就绪后，使用已验证的公钥更新 known_hosts；未就绪的步骤会明确标记待处理。" FontSize="11" Foreground="#7C8BA0" Margin="0,5,0,0" TextWrapping="Wrap"/>
       </StackPanel>
     </Grid>
   </Grid>

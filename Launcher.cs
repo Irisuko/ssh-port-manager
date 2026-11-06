@@ -17,7 +17,7 @@ internal static class Launcher
         "Coder.psm1", "CoderJob.psm1", "CredentialStore.psm1", "HostManagement.psm1",
         "HostManager.ps1", "HostManager.xaml", "Mappings.psm1", "Operations.psm1",
         "SshConfig.psm1", "Start-Coder.ps1", "CoderTerminal.psm1",
-        "PreparationJob.psm1", "Start-Prepare.ps1"
+        "PreparationJob.psm1", "Start-Prepare.ps1", "HostKeys.psm1", "VsCode.psm1"
     };
 
     [STAThread]

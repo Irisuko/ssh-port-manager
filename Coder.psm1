@@ -180,11 +180,12 @@ function Invoke-CoderWorkspace {
     param(
         [Parameter(Mandatory = $true)]$Alias,
         [Parameter(Mandatory = $true)][Management.Automation.PSCredential]$Credential,
-        [ValidateRange(1, 86400)][int]$TimeoutSeconds = 600,
+        [ValidateRange(1, 86400)][int]$TimeoutSeconds = 180,
         [ValidateRange(1, 60000)][int]$PollIntervalMilliseconds = 2000,
         [scriptblock]$OnProgress,
         [scriptblock]$RequestHandler,
         [switch]$RequireAlreadyRunning,
+        [switch]$AllowUnreadyPort,
         [Collections.IDictionary]$Mappings,
         [string]$WorkspaceName
     )
@@ -239,7 +240,9 @@ function Invoke-CoderWorkspace {
             $buildId = Get-CoderObjectId $build
             $status = [string](Get-CoderField $build 'status')
             if ($RequireAlreadyRunning -and $status -cne 'running') {
-                throw 'Read-only verification requires an already running workspace; no start was submitted.'
+                $notRunningError = [InvalidOperationException]::new('Read-only verification requires an already running workspace; no start was submitted.')
+                $notRunningError.Data['CoderNotRunning'] = $true
+                throw $notRunningError
             }
             switch -CaseSensitive -Exact ($status) {
                 'running' {
@@ -303,6 +306,20 @@ function Invoke-CoderWorkspace {
                     }
                 }
                 { $_ -ceq 'pending' -or $_ -ceq 'starting' -or $_ -ceq 'stopping' -or $_ -ceq 'canceling' } {
+                    if ($AllowUnreadyPort -and $fullBuild -and @('pending','starting') -ccontains $status) {
+                        $allocatedPort=$null
+                        try { $allocatedPort=Get-CoderSshPort -Build $build } catch { }
+                        if ($null -ne $allocatedPort) {
+                            $currentWorkspace=Invoke-CoderApi @apiArgs -Method GET -Path $workspacePath
+                            $currentBuild=Get-CoderField $currentWorkspace 'latest_build'
+                            if ((Get-CoderObjectId $currentWorkspace) -cne $workspaceId -or (Get-CoderObjectId $currentBuild) -cne $buildId) {
+                                throw 'Coder workspace changed while reading its allocated SSH port; the old build port was not used.'
+                            }
+                            if ([string](Get-CoderField $currentBuild 'status') -cne $status) { $build=$currentBuild; $fullBuild=$false; continue }
+                            Send-CoderProgress $OnProgress ($workspaceName + ' 仍在等待启动，已分配 SSH 端口：' + $allocatedPort + '。')
+                            return [pscustomobject]@{WorkspaceName=$workspaceName;Port=$allocatedPort;Started=$started;Status=$status;Deferred=$true}
+                        }
+                    }
                     if ($status -ceq 'stopping' -or $status -ceq 'canceling') { $refreshAfterStop = $true }
                     Send-CoderProgress $OnProgress ($workspaceName + ' 当前状态：' + $status + '，正在等待…')
                     $remaining = Get-CoderRemainingMilliseconds $clock $TimeoutSeconds
