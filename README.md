@@ -4,7 +4,7 @@ Windows 10/11 本地小工具：管理 SSH 主机及其 Coder 对应关系，启
 
 ## 运行软件
 
-双击 **SSH 端口助手.exe** 即可使用。发布版是单个 EXE，可单独放到桌面，无需附带源码目录；使用 Windows 自带的 .NET Framework、Windows PowerShell 5.1 和 OpenSSH 客户端。
+从 [最新发布下载 SSH-Port-Manager.exe](https://github.com/Irisuko/ssh-port-manager/releases/latest/download/SSH-Port-Manager.exe)，双击即可使用。[查看版本说明及校验文件](https://github.com/Irisuko/ssh-port-manager/releases/latest)。发布版是单个 EXE，可单独放到桌面，无需附带源码目录；使用 Windows 的 .NET Framework、Windows PowerShell 5.1 和 OpenSSH 客户端。
 
 运行时文件会按版本内容释放到 `%LOCALAPPDATA%\SshPortManager\Runtime`。登录信息和对应关系仍保存在 `%LOCALAPPDATA%\SshPortManager`，更新 EXE 不会覆盖这些设置。发布文件不包含账号密码、SSH 配置或本机备份。
 
