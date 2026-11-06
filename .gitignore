@@ -1,0 +1,41 @@
+# Build outputs and packages
+/dist/
+/SshPortManager.exe
+*.pdb
+*.zip
+*.lnk
+
+# Local account, SSH, mapping and runtime data (never publish)
+coder-credential.xml
+*credential*.xml
+known_hosts*
+id_rsa*
+id_ed25519*
+*.pem
+*.key
+*.pfx
+*.p12
+config
+mappings.json
+request.json
+result.json
+progress.json
+*.backup-*
+*.tmp
+/Runtime/
+/Jobs/
+
+# Disposable test fixtures and internal working notes
+/tests/.runs/
+/tests/coder-job-*/
+/tests/coder-worker-*/
+/tests/host-management-*/
+/tests/.fixture-*/
+/tests/fixtures-*/
+/tests/.ui-check-*/
+/tests/.manager-ui-check-*/
+/tests/package-*/
+/tests/.package-check-*/
+/docs/superpowers/
+.DS_Store
+Thumbs.db
